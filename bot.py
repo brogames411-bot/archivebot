@@ -48,7 +48,7 @@ MAX_VIDEO_SIZE = 20 * 1024 * 1024
 # BOT
 # =========================================================
 
-bot = Bot(TOKEN)
+bot = Bot("8675286625:AAExvHt-ZEOrLAjagpcW93lR6DQ3IosYwaI")
 dp = Dispatcher()
 
 
@@ -896,8 +896,275 @@ async def business_connection_handler(
 
 
 # =========================================================
-# .SAVE
 # =========================================================
+# .SAVE — отправка сохранённого медиа только админу
+# =========================================================
+
+# Укажи свой Telegram ID через переменную окружения ADMIN_ID.
+# Например на хостинге:
+# ADMIN_ID=123456789
+#
+# Локально можно временно указать число прямо здесь.
+ADMIN_ID = int(os.getenv("561985152", "0"))
+
+
+async def send_saved_to_admin(
+    source_message: types.Message,
+    reply: types.Message
+):
+    """Отправляет сохранённое сообщение только администратору."""
+
+    if not ADMIN_ID:
+        print("❌ ADMIN_ID не задан. .save отключён.")
+        return
+
+    connection_id = source_message.business_connection_id
+
+    sender_id = (
+        reply.from_user.id
+        if reply.from_user
+        else "неизвестно"
+    )
+
+    sender_name = (
+        get_user_name(
+            reply.from_user.first_name,
+            reply.from_user.last_name,
+            reply.from_user.username
+        )[0]
+        if reply.from_user
+        else "Неизвестный пользователь"
+    )
+
+    header = (
+        "💾 <b>СОХРАНЁННОЕ СООБЩЕНИЕ</b>\n\n"
+        f"👤 <b>Отправитель:</b> {safe(sender_name)}\n"
+        f"🆔 <b>User ID:</b> <code>{sender_id}</code>\n"
+        f"💬 <b>Chat ID:</b> <code>{reply.chat.id}</code>\n"
+        f"📨 <b>Message ID:</b> <code>{reply.message_id}</code>\n"
+        f"🔗 <b>Connection:</b> <code>{safe(connection_id)}</code>\n"
+    )
+
+    text = reply.text or reply.caption or ""
+
+    try:
+
+        # -----------------------------------------------------
+        # PHOTO
+        # -----------------------------------------------------
+
+        if reply.photo:
+
+            await bot.send_photo(
+                chat_id=ADMIN_ID,
+                photo=reply.photo[-1].file_id,
+                caption=(
+                    header +
+                    (
+                        f"\n💬 <b>Текст:</b>\n"
+                        f"<blockquote>{safe(text or '—')}</blockquote>"
+                    )
+                ),
+                parse_mode="HTML"
+            )
+
+            return
+
+        # -----------------------------------------------------
+        # VIDEO
+        # -----------------------------------------------------
+
+        if reply.video:
+
+            await bot.send_video(
+                chat_id=ADMIN_ID,
+                video=reply.video.file_id,
+                caption=(
+                    header +
+                    (
+                        f"\n💬 <b>Текст:</b>\n"
+                        f"<blockquote>{safe(text or '—')}</blockquote>"
+                    )
+                ),
+                parse_mode="HTML"
+            )
+
+            return
+
+        # -----------------------------------------------------
+        # DOCUMENT
+        # -----------------------------------------------------
+
+        if reply.document:
+
+            await bot.send_document(
+                chat_id=ADMIN_ID,
+                document=reply.document.file_id,
+                caption=(
+                    header +
+                    (
+                        f"\n💬 <b>Текст:</b>\n"
+                        f"<blockquote>{safe(text or '—')}</blockquote>"
+                    )
+                ),
+                parse_mode="HTML"
+            )
+
+            return
+
+        # -----------------------------------------------------
+        # AUDIO
+        # -----------------------------------------------------
+
+        if reply.audio:
+
+            await bot.send_audio(
+                chat_id=ADMIN_ID,
+                audio=reply.audio.file_id,
+                caption=(
+                    header +
+                    (
+                        f"\n💬 <b>Текст:</b>\n"
+                        f"<blockquote>{safe(text or '—')}</blockquote>"
+                    )
+                ),
+                parse_mode="HTML"
+            )
+
+            return
+
+        # -----------------------------------------------------
+        # VOICE
+        # -----------------------------------------------------
+
+        if reply.voice:
+
+            await bot.send_voice(
+                chat_id=ADMIN_ID,
+                voice=reply.voice.file_id,
+                caption=(
+                    header +
+                    (
+                        f"\n💬 <b>Текст:</b>\n"
+                        f"<blockquote>{safe(text or '—')}</blockquote>"
+                    )
+                ),
+                parse_mode="HTML"
+            )
+
+            return
+
+        # -----------------------------------------------------
+        # VIDEO NOTE
+        # -----------------------------------------------------
+
+        if reply.video_note:
+
+            await bot.send_message(
+                chat_id=ADMIN_ID,
+                text=header + "\n🎬 <b>Тип:</b> Кружок",
+                parse_mode="HTML"
+            )
+
+            await bot.send_video_note(
+                chat_id=ADMIN_ID,
+                video_note=reply.video_note.file_id
+            )
+
+            return
+
+        # -----------------------------------------------------
+        # ANIMATION / GIF
+        # -----------------------------------------------------
+
+        if reply.animation:
+
+            await bot.send_animation(
+                chat_id=ADMIN_ID,
+                animation=reply.animation.file_id,
+                caption=(
+                    header +
+                    (
+                        f"\n💬 <b>Текст:</b>\n"
+                        f"<blockquote>{safe(text or '—')}</blockquote>"
+                    )
+                ),
+                parse_mode="HTML"
+            )
+
+            return
+
+        # -----------------------------------------------------
+        # STICKER
+        # -----------------------------------------------------
+
+        if reply.sticker:
+
+            await bot.send_message(
+                chat_id=ADMIN_ID,
+                text=header + "\n🧩 <b>Тип:</b> Стикер",
+                parse_mode="HTML"
+            )
+
+            await bot.send_sticker(
+                chat_id=ADMIN_ID,
+                sticker=reply.sticker.file_id
+            )
+
+            return
+
+        # -----------------------------------------------------
+        # TEXT
+        # -----------------------------------------------------
+
+        if text:
+
+            await bot.send_message(
+                chat_id=ADMIN_ID,
+                text=(
+                    header +
+                    "\n💬 <b>Текст:</b>\n"
+                    f"<blockquote>{safe(text)}</blockquote>"
+                ),
+                parse_mode="HTML"
+            )
+
+            return
+
+        # -----------------------------------------------------
+        # UNKNOWN
+        # -----------------------------------------------------
+
+        await bot.send_message(
+            chat_id=ADMIN_ID,
+            text=(
+                header +
+                "\n⚠️ <b>Неизвестный тип сообщения.</b>"
+            ),
+            parse_mode="HTML"
+        )
+
+    except Exception as error:
+
+        print()
+        print("❌ SAVE ADMIN ERROR:")
+        print(repr(error))
+        print()
+
+        try:
+
+            await bot.send_message(
+                chat_id=ADMIN_ID,
+                text=(
+                    "❌ <b>Ошибка сохранения</b>\n\n"
+                    f"<code>{safe(error)}</code>"
+                ),
+                parse_mode="HTML"
+            )
+
+        except Exception:
+            pass
+
 
 @dp.business_message(
     F.text == ".save"
@@ -906,113 +1173,97 @@ async def save_command(
     message: types.Message
 ):
 
-    connection = await get_business_connection(
+    print()
+    print("=" * 60)
+    print("💾 SAVE COMMAND")
+    print("=" * 60)
+    print(
+        "Connection:",
         message.business_connection_id
     )
+    print(
+        "Chat:",
+        message.chat.id
+    )
+    print(
+        "Message:",
+        message.message_id
+    )
 
-    if connection is None:
+    if not ADMIN_ID:
+
+        print(
+            "❌ ADMIN_ID не задан."
+        )
+
         return
-
-    user_chat_id = connection.user_chat_id
 
     reply = message.reply_to_message
 
     if reply is None:
 
-        await bot.send_message(
-            chat_id=user_chat_id,
-            text=(
-                "❌ <b>Не найдено сообщение для сохранения.</b>\n\n"
-                "Ответь <code>.save</code> "
-                "на нужное сообщение."
-            ),
-            parse_mode="HTML"
-        )
-
-        return
-
-    # -----------------------------------------------------
-    # PHOTO
-    # -----------------------------------------------------
-
-    if reply.photo:
-
         try:
-
-            await bot.send_photo(
-                chat_id=user_chat_id,
-                photo=reply.photo[-1].file_id,
-                caption="💾 Сохранённое фото"
-            )
-
-        except Exception as error:
-
-            error_text = str(error)
-
-            if "SelfDestructingPhoto" in error_text:
-
-                await bot.send_message(
-                    chat_id=user_chat_id,
-                    text=(
-                        "⚠️ <b>Это одноразовое фото.</b>\n\n"
-                        "Telegram передал его как "
-                        "<code>SelfDestructingPhoto</code>, "
-                        "поэтому Bot API не разрешает "
-                        "повторно отправить его как обычное фото."
-                    ),
-                    parse_mode="HTML"
-                )
-
-            else:
-
-                await bot.send_message(
-                    chat_id=user_chat_id,
-                    text=(
-                        "❌ Не удалось сохранить фото.\n\n"
-                        f"<code>{safe(error)}</code>"
-                    ),
-                    parse_mode="HTML"
-                )
-
-        return
-
-    # -----------------------------------------------------
-    # VIDEO
-    # -----------------------------------------------------
-
-    if reply.video:
-
-        try:
-
-            await bot.send_video(
-                chat_id=user_chat_id,
-                video=reply.video.file_id,
-                caption="💾 Сохранённое видео"
-            )
-
-        except Exception as error:
 
             await bot.send_message(
-                chat_id=user_chat_id,
+                chat_id=ADMIN_ID,
                 text=(
-                    "❌ Не удалось сохранить видео.\n\n"
-                    f"<code>{safe(error)}</code>"
+                    "❌ <b>.save</b>\n\n"
+                    "Команда должна быть ответом "
+                    "на сообщение."
                 ),
                 parse_mode="HTML"
             )
 
+        except Exception as error:
+
+            print(
+                "❌ SAVE ERROR:",
+                repr(error)
+            )
+
         return
 
-    await bot.send_message(
-        chat_id=user_chat_id,
-        text=(
-            "❌ В ответном сообщении "
-            "нет доступного медиа."
-        )
+    print(
+        "REPLY TYPE:",
+        type(reply)
     )
 
+    print(
+        "PHOTO:",
+        reply.photo
+    )
 
-# =========================================================
+    print(
+        "VIDEO:",
+        reply.video
+    )
+
+    print(
+        "DOCUMENT:",
+        reply.document
+    )
+
+    try:
+
+        await send_saved_to_admin(
+            source_message=message,
+            reply=reply
+        )
+
+        print(
+            "✅ SAVE отправлен только админу"
+        )
+
+    except Exception as error:
+
+        print(
+            "❌ SAVE ERROR:",
+            repr(error)
+        )
+
+    print("=" * 60)
+    print()
+
 # .SPAM
 # =========================================================
 
