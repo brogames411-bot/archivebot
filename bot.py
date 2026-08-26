@@ -23,18 +23,26 @@ from aiogram.types import (
 
 TOKEN = "8675286625:AAExvHt-ZEOrLAjagpcW93lR6DQ3IosYwaI"
 
+# Точный путь к FFmpeg на твоём компьютере
+FFMPEG_PATH = (
+    r"C:\Users\1\AppData\Local\Microsoft\WinGet\Packages"
+    r"\Gyan.FFmpeg_Microsoft.Winget.Source_8wekyb3d8bbwe"
+    r"\ffmpeg-9.0.1-full_build\bin\ffmpeg.exe"
+)
+
 SUPPORT_URL = "https://t.me/your_support"
 PREMIUM_URL = "https://t.me/your_premium"
 
 MAX_SPAM_COUNT = 10
 SPAM_DELAY = 0.35
 
-# Максимальная длина видео для кружка
 MAX_VIDEO_DURATION = 60
-
-# Размер кружка
 VIDEO_NOTE_SIZE = 640
 
+
+# =========================================================
+# BOT
+# =========================================================
 
 bot = Bot(TOKEN)
 dp = Dispatcher()
@@ -139,6 +147,7 @@ CREATE TABLE IF NOT EXISTS spam_messages (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
 
     owner_id INTEGER NOT NULL,
+
     connection_id TEXT NOT NULL,
     chat_id INTEGER NOT NULL,
     message_id INTEGER NOT NULL,
@@ -172,8 +181,6 @@ db.commit()
 
 active_spam_tasks = {}
 
-# Пользователи, которые нажали:
-# 🎥 Видео → кружок
 converter_users = set()
 
 
@@ -249,6 +256,7 @@ def get_settings(owner_id):
 async def get_business_connection(
     connection_id
 ):
+
     try:
 
         return await bot.get_business_connection(
@@ -460,7 +468,7 @@ def make_diff_html(
 
 
 # =========================================================
-# MAIN MENU
+# KEYBOARDS
 # =========================================================
 
 def main_keyboard():
@@ -543,6 +551,20 @@ def main_keyboard():
     )
 
 
+def back_keyboard():
+
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="⬅️ Назад",
+                    callback_data="open_menu"
+                )
+            ]
+        ]
+    )
+
+
 def settings_keyboard(
     delete_notifications,
     save_media,
@@ -589,20 +611,6 @@ def settings_keyboard(
                 )
             ]
 
-        ]
-    )
-
-
-def back_keyboard():
-
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="⬅️ Назад",
-                    callback_data="open_menu"
-                )
-            ]
         ]
     )
 
@@ -736,7 +744,6 @@ async def save_command(
         return
 
     user_chat_id = connection.user_chat_id
-
     reply = message.reply_to_message
 
     if reply is None:
@@ -753,6 +760,7 @@ async def save_command(
 
         return
 
+    # Фото
     if reply.photo:
 
         try:
@@ -794,6 +802,7 @@ async def save_command(
 
         return
 
+    # Видео
     if reply.video:
 
         try:
@@ -903,6 +912,9 @@ async def spam_command(
 
         return
 
+    if not text:
+        return
+
     if owner_id in active_spam_tasks:
         return
 
@@ -921,6 +933,7 @@ async def spam_command(
         )
 
     stop_event = asyncio.Event()
+
     active_spam_tasks[owner_id] = stop_event
 
     try:
@@ -1028,7 +1041,7 @@ async def stop_spam(
 
 
 # =========================================================
-# BSPAM
+# .BSPAM
 # =========================================================
 
 @dp.business_message(
@@ -1138,7 +1151,7 @@ async def bspam_command(
 
 
 # =========================================================
-# VIDEO CONVERTER MENU
+# CONVERTER MENU
 # =========================================================
 
 @dp.callback_query(
@@ -1180,10 +1193,7 @@ async def video_to_circle(
         "преобразовать в Telegram-кружок 🎬\n\n"
 
         "⏱ Максимальная длительность: "
-        "<b>60 секунд</b>.\n\n"
-
-        "После отправки видео начнётся "
-        "автоматическая обработка.",
+        "<b>60 секунд</b>.",
 
         parse_mode="HTML",
 
@@ -1225,7 +1235,7 @@ async def cancel_converter(
     )
 
     await callback.answer(
-        "Конвертация отменена"
+        "Отменено"
     )
 
 
@@ -1233,16 +1243,15 @@ async def cancel_converter(
 # VIDEO CONVERTER
 # =========================================================
 
-@dp.message(
-    F.video
-)
+@dp.message(F.video)
 async def convert_video_handler(
     message: types.Message
 ):
 
     user_id = message.from_user.id
 
-    # Пользователь не находится в режиме конвертации
+    # Конвертируем только после нажатия
+    # кнопки "Видео → кружок"
     if user_id not in converter_users:
         return
 
@@ -1256,15 +1265,32 @@ async def convert_video_handler(
     )
 
     # -----------------------------------------------------
+    # Проверяем FFmpeg
+    # -----------------------------------------------------
+
+    if not os.path.isfile(
+        FFMPEG_PATH
+    ):
+
+        await message.answer(
+            "❌ <b>FFmpeg не найден.</b>\n\n"
+            "Проверь путь:\n"
+            f"<code>{safe(FFMPEG_PATH)}</code>",
+            parse_mode="HTML"
+        )
+
+        return
+
+    # -----------------------------------------------------
     # Проверка длительности
     # -----------------------------------------------------
 
     if duration > MAX_VIDEO_DURATION:
 
         await message.answer(
-            "❌ Видео слишком длинное.\n\n"
-            "Максимальная длительность для "
-            "кружка — <b>60 секунд</b>.",
+            "❌ Видео длиннее 60 секунд.\n\n"
+            "Для кружка максимальная длина — "
+            "<b>60 секунд</b>.",
             parse_mode="HTML"
         )
 
@@ -1274,17 +1300,19 @@ async def convert_video_handler(
     # Проверка размера
     # -----------------------------------------------------
 
-    if message.video.file_size:
+    if (
+        message.video.file_size
+        and
+        message.video.file_size
+        > 50 * 1024 * 1024
+    ):
 
-        # 50 MB
-        if message.video.file_size > 50 * 1024 * 1024:
+        await message.answer(
+            "❌ Видео слишком большое.\n\n"
+            "Попробуй файл меньше 50 МБ."
+        )
 
-            await message.answer(
-                "❌ Видео слишком большое.\n\n"
-                "Попробуй файл меньше 50 МБ."
-            )
-
-            return
+        return
 
     unique_id = uuid.uuid4().hex
 
@@ -1296,21 +1324,24 @@ async def convert_video_handler(
         f"video_circle_{unique_id}.mp4"
     )
 
+    status = None
+
     try:
 
         # -------------------------------------------------
-        # Индикатор
+        # STATUS
         # -------------------------------------------------
 
         status = await message.answer(
             "⏳ <b>Конвертирую видео...</b>\n\n"
-            "🎥 Видео получено\n"
-            "⚙️ Обработка через FFmpeg",
+            "📥 Получаю файл\n"
+            "⚙️ Обрабатываю через FFmpeg\n"
+            "🎬 Готовлю кружок",
             parse_mode="HTML"
         )
 
         # -------------------------------------------------
-        # Получаем Telegram File
+        # Получаем файл Telegram
         # -------------------------------------------------
 
         telegram_file = await bot.get_file(
@@ -1320,13 +1351,13 @@ async def convert_video_handler(
         if not telegram_file.file_path:
 
             await status.edit_text(
-                "❌ Telegram не вернул путь к файлу."
+                "❌ Telegram не вернул путь к видео."
             )
 
             return
 
         # -------------------------------------------------
-        # Скачиваем
+        # Скачиваем видео
         # -------------------------------------------------
 
         await bot.download_file(
@@ -1337,21 +1368,10 @@ async def convert_video_handler(
         # -------------------------------------------------
         # FFmpeg
         # -------------------------------------------------
-        #
-        # Делаем квадрат 640x640.
-        #
-        # Если видео вертикальное:
-        # обрезаются верх/низ.
-        #
-        # Если горизонтальное:
-        # обрезаются края.
-        #
-        # Сохраняем H.264 MP4.
-        # -------------------------------------------------
 
         ffmpeg_command = [
 
-            "ffmpeg",
+            FFMPEG_PATH,
 
             "-y",
 
@@ -1379,7 +1399,11 @@ async def convert_video_handler(
             "-pix_fmt",
             "yuv420p",
 
-            "-an",
+            "-c:a",
+            "aac",
+
+            "-b:a",
+            "128k",
 
             "-t",
             "60",
@@ -1390,15 +1414,41 @@ async def convert_video_handler(
             output_file
         ]
 
-        process = await asyncio.create_subprocess_exec(
-            *ffmpeg_command,
+        print()
+        print("=" * 60)
+        print("🎬 FFMPEG")
+        print("=" * 60)
+        print(
+            "FFmpeg:",
+            FFMPEG_PATH
+        )
+        print(
+            "Input:",
+            input_file
+        )
+        print(
+            "Output:",
+            output_file
+        )
+        print("=" * 60)
 
-            stdout=asyncio.subprocess.PIPE,
+        # -------------------------------------------------
+        # Запускаем FFmpeg
+        # -------------------------------------------------
 
-            stderr=asyncio.subprocess.PIPE
+        process = (
+            await asyncio.create_subprocess_exec(
+                *ffmpeg_command,
+
+                stdout=asyncio.subprocess.PIPE,
+
+                stderr=asyncio.subprocess.PIPE
+            )
         )
 
-        stdout, stderr = await process.communicate()
+        stdout, stderr = (
+            await process.communicate()
+        )
 
         if process.returncode != 0:
 
@@ -1415,24 +1465,24 @@ async def convert_video_handler(
             )
 
             await status.edit_text(
-                "❌ <b>FFmpeg не смог обработать видео.</b>\n\n"
-                f"<code>{safe(error_text[-1500:])}</code>",
+                "❌ <b>Ошибка FFmpeg.</b>\n\n"
+                f"<code>{safe(error_text[-2000:])}</code>",
                 parse_mode="HTML"
             )
 
             return
 
         # -------------------------------------------------
-        # Проверяем выходной файл
+        # Проверяем результат
         # -------------------------------------------------
 
-        if not os.path.exists(
+        if not os.path.isfile(
             output_file
         ):
 
             await status.edit_text(
-                "❌ После обработки "
-                "файл не найден."
+                "❌ FFmpeg завершился, "
+                "но выходной файл не найден."
             )
 
             return
@@ -1442,7 +1492,7 @@ async def convert_video_handler(
         )
 
         print(
-            "✅ Конвертация завершена"
+            "✅ Конвертация завершена."
         )
 
         print(
@@ -1451,20 +1501,36 @@ async def convert_video_handler(
         )
 
         # -------------------------------------------------
-        # Отправляем как кружок
+        # Проверка размера готового файла
         # -------------------------------------------------
 
-        video_note = FSInputFile(
-            output_file
-        )
+        if output_size > 50 * 1024 * 1024:
 
+            await status.edit_text(
+                "❌ Готовый кружок получился "
+                "слишком большим."
+            )
+
+            return
+
+        # -------------------------------------------------
         # Удаляем статус
+        # -------------------------------------------------
+
         try:
 
             await status.delete()
 
         except Exception:
             pass
+
+        # -------------------------------------------------
+        # Отправляем кружок
+        # -------------------------------------------------
+
+        video_note = FSInputFile(
+            output_file
+        )
 
         await bot.send_video_note(
             chat_id=message.chat.id,
@@ -1475,33 +1541,36 @@ async def convert_video_handler(
                 MAX_VIDEO_DURATION
             )
         )
-
+        # Удаляем исходное видео после успешной конвертации
+        try:
+            await message.delete()
+            print("🗑 Исходное видео удалено")
+        except Exception as error:
+            print(
+                "⚠️ Не удалось удалить исходное видео:",
+                repr(error)
+            )
         # -------------------------------------------------
-        # Чистое меню после конвертации
+        # Возврат в меню
         # -------------------------------------------------
 
         await message.answer(
             "✅ <b>Готово!</b>\n\n"
-            "Видео превращено в кружок 🎬",
+            "Видео преобразовано в кружок 🎬",
             parse_mode="HTML",
             reply_markup=back_keyboard()
         )
 
-    except FileNotFoundError:
-
-        await message.answer(
-            "❌ <b>FFmpeg не найден.</b>\n\n"
-            "Установи FFmpeg и добавь его "
-            "в PATH системы.",
-            parse_mode="HTML"
-        )
-
     except Exception as error:
 
+        print()
         print(
-            "❌ CONVERTER ERROR:",
+            "❌ CONVERTER ERROR:"
+        )
+        print(
             repr(error)
         )
+        print()
 
         try:
 
@@ -1540,7 +1609,7 @@ async def convert_video_handler(
                 print(
                     "⚠️ Не удалось удалить:",
                     filename,
-                    error
+                    repr(error)
                 )
 
 
@@ -1620,7 +1689,6 @@ async def business_message_handler(
             file_id,
 
             deleted
-
         )
 
         VALUES (
@@ -1692,11 +1760,9 @@ async def edited_business_message_handler(
             first_name,
             last_name,
             text,
-            date,
             media_type,
             file_id
         FROM messages
-
         WHERE connection_id = ?
           AND chat_id = ?
           AND message_id = ?
@@ -1716,7 +1782,6 @@ async def edited_business_message_handler(
             old_first_name,
             old_last_name,
             old_text,
-            old_date,
             old_media_type,
             old_file_id
         ) = old_row
@@ -1729,8 +1794,6 @@ async def edited_business_message_handler(
         old_last_name = None
 
         old_text = ""
-        old_date = ""
-
         old_media_type = "text"
         old_file_id = None
 
@@ -1841,7 +1904,9 @@ async def edited_business_message_handler(
         last_name,
 
         new_text,
-        message.date.isoformat(),
+        datetime.now(
+            timezone.utc
+        ).isoformat(),
 
         new_media_type,
         new_file_id
@@ -1936,9 +2001,7 @@ async def deleted_business_messages_handler(
 
         cursor.execute("""
             UPDATE messages
-
             SET deleted = 1
-
             WHERE connection_id = ?
               AND chat_id = ?
               AND message_id = ?
@@ -2094,7 +2157,7 @@ async def deleted_business_messages_handler(
 
 
 # =========================================================
-# MAIN MENU COMMANDS
+# /START /MENU
 # =========================================================
 
 @dp.message(Command("start"))
@@ -2106,7 +2169,9 @@ async def menu_command(
     owner_id = message.from_user.id
 
     try:
+
         await message.delete()
+
     except Exception:
         pass
 
@@ -2126,7 +2191,9 @@ async def menu_command(
         "Выберите раздел:"
     )
 
-    state = get_menu_state(owner_id)
+    state = get_menu_state(
+        owner_id
+    )
 
     if state:
 
@@ -2140,12 +2207,6 @@ async def menu_command(
                 text=text,
                 parse_mode="HTML",
                 reply_markup=main_keyboard()
-            )
-
-            save_menu_state(
-                owner_id,
-                old_chat_id,
-                old_message_id
             )
 
             return
@@ -2167,7 +2228,7 @@ async def menu_command(
 
 
 # =========================================================
-# BACK TO MENU
+# BACK MENU
 # =========================================================
 
 @dp.callback_query(
@@ -2355,7 +2416,7 @@ async def open_commands(
         "💬 <b>Команды</b>\n\n"
 
         "<code>.save</code>\n"
-        "Сохранить доступное медиа из reply.\n\n"
+        "Сохранить доступное медиа из ответа.\n\n"
 
         "<code>.spam N текст</code>\n"
         "Отправить N сообщений.\n\n"
@@ -2488,11 +2549,7 @@ async def toggle_deletions(
         )
     )
 
-    await callback.answer(
-        "Удаления включены ✅"
-        if new_value
-        else "Удаления выключены ❌"
-    )
+    await callback.answer()
 
 
 @dp.callback_query(
@@ -2531,11 +2588,7 @@ async def toggle_media(
         )
     )
 
-    await callback.answer(
-        "Медиа включено ✅"
-        if new_value
-        else "Медиа выключено ❌"
-    )
+    await callback.answer()
 
 
 @dp.callback_query(
@@ -2574,15 +2627,11 @@ async def toggle_edits(
         )
     )
 
-    await callback.answer(
-        "Изменения включены ✅"
-        if new_value
-        else "Изменения выключены ❌"
-    )
+    await callback.answer()
 
 
 # =========================================================
-# STATISTICS
+# STATS
 # =========================================================
 
 @dp.callback_query(
@@ -2596,9 +2645,12 @@ async def open_stats(
 
     cursor.execute("""
         SELECT COUNT(*)
+
         FROM messages m
+
         INNER JOIN business_connections b
         ON m.connection_id = b.connection_id
+
         WHERE b.owner_id = ?
     """, (
         owner_id,
@@ -2608,9 +2660,12 @@ async def open_stats(
 
     cursor.execute("""
         SELECT COUNT(*)
+
         FROM messages m
+
         INNER JOIN business_connections b
         ON m.connection_id = b.connection_id
+
         WHERE b.owner_id = ?
           AND m.deleted = 1
     """, (
@@ -2621,9 +2676,12 @@ async def open_stats(
 
     cursor.execute("""
         SELECT COUNT(*)
+
         FROM messages m
+
         INNER JOIN business_connections b
         ON m.connection_id = b.connection_id
+
         WHERE b.owner_id = ?
           AND m.media_type != 'text'
     """, (
@@ -2774,7 +2832,7 @@ async def invite_friend(
 
 
 # =========================================================
-# COMMANDS IN PRIVATE CHAT
+# PRIVATE COMMANDS
 # =========================================================
 
 @dp.message(Command("settings"))
@@ -2868,9 +2926,7 @@ async def private_stats_command(
         INNER JOIN business_connections b
         ON m.connection_id = b.connection_id
         WHERE b.owner_id = ?
-    """, (
-        owner_id,
-    ))
+    """, (owner_id,))
 
     total = cursor.fetchone()[0]
 
@@ -2881,9 +2937,7 @@ async def private_stats_command(
         ON m.connection_id = b.connection_id
         WHERE b.owner_id = ?
           AND m.deleted = 1
-    """, (
-        owner_id,
-    ))
+    """, (owner_id,))
 
     deleted = cursor.fetchone()[0]
 
@@ -2894,15 +2948,12 @@ async def private_stats_command(
         ON m.connection_id = b.connection_id
         WHERE b.owner_id = ?
           AND m.media_type != 'text'
-    """, (
-        owner_id,
-    ))
+    """, (owner_id,))
 
     media = cursor.fetchone()[0]
 
     text = (
         "📊 <b>Статистика</b>\n\n"
-
         f"💬 Сообщений: <b>{total}</b>\n"
         f"🗑 Удалённых: <b>{deleted}</b>\n"
         f"📦 Медиа: <b>{media}</b>"
@@ -2974,9 +3025,7 @@ async def private_deleted_command(
         ORDER BY m.id DESC
 
         LIMIT 10
-    """, (
-        owner_id,
-    ))
+    """, (owner_id,))
 
     rows = cursor.fetchall()
 
@@ -2989,9 +3038,7 @@ async def private_deleted_command(
 
     else:
 
-        text = (
-            "🗑 <b>Последние удаления</b>\n\n"
-        )
+        text = "🗑 <b>Последние удаления</b>\n\n"
 
         for row in rows:
 
@@ -3053,7 +3100,7 @@ async def private_deleted_command(
 
 
 # =========================================================
-# MAIN
+# START
 # =========================================================
 
 async def main():
@@ -3063,9 +3110,31 @@ async def main():
     print("🚀 BUSINESS ARCHIVE ЗАПУЩЕН")
     print("=" * 60)
     print()
+    print(
+        "FFmpeg:",
+        FFMPEG_PATH
+    )
+
+    if os.path.isfile(FFMPEG_PATH):
+
+        print(
+            "✅ FFmpeg найден"
+        )
+
+    else:
+
+        print(
+            "❌ FFmpeg НЕ найден!"
+        )
+
+    print()
 
     await dp.start_polling(bot)
 
+
+# =========================================================
+# RUN
+# =========================================================
 
 if __name__ == "__main__":
     asyncio.run(main())
