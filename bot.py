@@ -410,63 +410,15 @@ def media_name(media_type):
     )
 
 
-def make_diff_html(
-    old_text,
-    new_text
-):
+def make_diff_html(old_text, new_text):
 
-    old_text = old_text or ""
-    new_text = new_text or ""
-
-    matcher = difflib.SequenceMatcher(
-        None,
-        old_text,
-        new_text
-    )
-
-    old_result = []
-    new_result = []
-
-    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
-
-        if tag == "equal":
-
-            old_result.append(
-                safe(old_text[i1:i2])
-            )
-
-            new_result.append(
-                safe(new_text[j1:j2])
-            )
-
-        elif tag == "delete":
-
-            old_result.append(
-                f"<s>{safe(old_text[i1:i2])}</s>"
-            )
-
-        elif tag == "insert":
-
-            new_result.append(
-                safe(new_text[j1:j2])
-            )
-
-        elif tag == "replace":
-
-            old_result.append(
-                f"<s>{safe(old_text[i1:i2])}</s>"
-            )
-
-            new_result.append(
-                safe(new_text[j1:j2])
-            )
+    old_text = old_text or "—"
+    new_text = new_text or "—"
 
     return (
-        "".join(old_result),
-        "".join(new_result)
+        safe(old_text),
+        safe(new_text)
     )
-
-
 # =========================================================
 # KEYBOARDS
 # =========================================================
