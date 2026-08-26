@@ -1,0 +1,3071 @@
+import asyncio
+import difflib
+import html
+import os
+import sqlite3
+import uuid
+from datetime import datetime, timezone
+
+from aiogram import Bot, Dispatcher, types, F
+from aiogram.filters import Command
+from aiogram.types import (
+    BusinessConnection,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
+    CallbackQuery,
+    FSInputFile,
+)
+
+
+# =========================================================
+# CONFIG
+# =========================================================
+
+TOKEN = "8675286625:AAExvHt-ZEOrLAjagpcW93lR6DQ3IosYwaI"
+
+SUPPORT_URL = "https://t.me/your_support"
+PREMIUM_URL = "https://t.me/your_premium"
+
+MAX_SPAM_COUNT = 10
+SPAM_DELAY = 0.35
+
+# Максимальная длина видео для кружка
+MAX_VIDEO_DURATION = 60
+
+# Размер кружка
+VIDEO_NOTE_SIZE = 640
+
+
+bot = Bot(TOKEN)
+dp = Dispatcher()
+
+
+# =========================================================
+# DATABASE
+# =========================================================
+
+db = sqlite3.connect(
+    "business_archive.db",
+    check_same_thread=False
+)
+
+cursor = db.cursor()
+
+
+# =========================================================
+# BUSINESS CONNECTIONS
+# =========================================================
+
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS business_connections (
+    connection_id TEXT PRIMARY KEY,
+    owner_id INTEGER NOT NULL,
+    user_chat_id INTEGER NOT NULL,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT,
+    last_chat_id INTEGER
+)
+""")
+
+try:
+    cursor.execute("""
+        ALTER TABLE business_connections
+        ADD COLUMN last_chat_id INTEGER
+    """)
+except sqlite3.OperationalError:
+    pass
+
+
+# =========================================================
+# MESSAGES
+# =========================================================
+
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS messages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+
+    connection_id TEXT NOT NULL,
+    chat_id INTEGER NOT NULL,
+    message_id INTEGER NOT NULL,
+
+    user_id INTEGER,
+    username TEXT,
+    first_name TEXT,
+    last_name TEXT,
+
+    text TEXT,
+    date TEXT,
+
+    media_type TEXT DEFAULT 'text',
+    file_id TEXT,
+
+    deleted INTEGER NOT NULL DEFAULT 0,
+
+    UNIQUE(connection_id, chat_id, message_id)
+)
+""")
+
+
+# =========================================================
+# SETTINGS
+# =========================================================
+
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS settings (
+    owner_id INTEGER PRIMARY KEY,
+
+    delete_notifications INTEGER NOT NULL DEFAULT 1,
+    save_media INTEGER NOT NULL DEFAULT 1,
+    edit_notifications INTEGER NOT NULL DEFAULT 1
+)
+""")
+
+try:
+    cursor.execute("""
+        ALTER TABLE settings
+        ADD COLUMN edit_notifications
+        INTEGER NOT NULL DEFAULT 1
+    """)
+except sqlite3.OperationalError:
+    pass
+
+
+# =========================================================
+# SPAM MESSAGES
+# =========================================================
+
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS spam_messages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+
+    owner_id INTEGER NOT NULL,
+    connection_id TEXT NOT NULL,
+    chat_id INTEGER NOT NULL,
+    message_id INTEGER NOT NULL,
+
+    created_at TEXT
+)
+""")
+
+
+# =========================================================
+# MENU STATE
+# =========================================================
+
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS menu_state (
+    owner_id INTEGER PRIMARY KEY,
+
+    chat_id INTEGER NOT NULL,
+    message_id INTEGER NOT NULL,
+
+    updated_at TEXT
+)
+""")
+
+db.commit()
+
+
+# =========================================================
+# RUNTIME STATE
+# =========================================================
+
+active_spam_tasks = {}
+
+# Пользователи, которые нажали:
+# 🎥 Видео → кружок
+converter_users = set()
+
+
+# =========================================================
+# HELPERS
+# =========================================================
+
+def safe(value):
+    if value is None:
+        return ""
+
+    return html.escape(str(value))
+
+
+def get_user_name(
+    first_name,
+    last_name,
+    username
+):
+    name = " ".join(
+        x for x in [first_name, last_name]
+        if x
+    )
+
+    if not name:
+        name = "Неизвестный пользователь"
+
+    username_text = (
+        f"@{username}"
+        if username
+        else "нет username"
+    )
+
+    return name, username_text
+
+
+def get_settings(owner_id):
+
+    cursor.execute("""
+        SELECT
+            delete_notifications,
+            save_media,
+            edit_notifications
+        FROM settings
+        WHERE owner_id = ?
+    """, (owner_id,))
+
+    row = cursor.fetchone()
+
+    if row is None:
+
+        cursor.execute("""
+            INSERT INTO settings (
+                owner_id,
+                delete_notifications,
+                save_media,
+                edit_notifications
+            )
+            VALUES (?, 1, 1, 1)
+        """, (owner_id,))
+
+        db.commit()
+
+        return True, True, True
+
+    return (
+        bool(row[0]),
+        bool(row[1]),
+        bool(row[2])
+    )
+
+
+async def get_business_connection(
+    connection_id
+):
+    try:
+
+        return await bot.get_business_connection(
+            business_connection_id=connection_id
+        )
+
+    except Exception as error:
+
+        print(
+            "❌ get_business_connection:",
+            repr(error)
+        )
+
+        return None
+
+
+def save_connection(
+    connection,
+    last_chat_id=None
+):
+
+    if last_chat_id is None:
+
+        cursor.execute("""
+            INSERT INTO business_connections (
+                connection_id,
+                owner_id,
+                user_chat_id,
+                enabled,
+                created_at
+            )
+            VALUES (?, ?, ?, ?, ?)
+
+            ON CONFLICT(connection_id)
+            DO UPDATE SET
+                owner_id = excluded.owner_id,
+                user_chat_id = excluded.user_chat_id,
+                enabled = excluded.enabled
+        """, (
+            connection.id,
+            connection.user.id,
+            connection.user_chat_id,
+            int(connection.is_enabled),
+            datetime.now(
+                timezone.utc
+            ).isoformat()
+        ))
+
+    else:
+
+        cursor.execute("""
+            INSERT INTO business_connections (
+                connection_id,
+                owner_id,
+                user_chat_id,
+                enabled,
+                created_at,
+                last_chat_id
+            )
+            VALUES (?, ?, ?, ?, ?, ?)
+
+            ON CONFLICT(connection_id)
+            DO UPDATE SET
+                owner_id = excluded.owner_id,
+                user_chat_id = excluded.user_chat_id,
+                enabled = excluded.enabled,
+                last_chat_id = excluded.last_chat_id
+        """, (
+            connection.id,
+            connection.user.id,
+            connection.user_chat_id,
+            int(connection.is_enabled),
+            datetime.now(
+                timezone.utc
+            ).isoformat(),
+            last_chat_id
+        ))
+
+    cursor.execute("""
+        INSERT OR IGNORE INTO settings (
+            owner_id,
+            delete_notifications,
+            save_media,
+            edit_notifications
+        )
+        VALUES (?, 1, 1, 1)
+    """, (
+        connection.user.id,
+    ))
+
+    db.commit()
+
+
+def get_media_info(message):
+
+    media_type = "text"
+    file_id = None
+
+    if message.photo:
+        media_type = "photo"
+        file_id = message.photo[-1].file_id
+
+    elif message.video:
+        media_type = "video"
+        file_id = message.video.file_id
+
+    elif message.voice:
+        media_type = "voice"
+        file_id = message.voice.file_id
+
+    elif message.video_note:
+        media_type = "video_note"
+        file_id = message.video_note.file_id
+
+    elif message.document:
+        media_type = "document"
+        file_id = message.document.file_id
+
+    elif message.audio:
+        media_type = "audio"
+        file_id = message.audio.file_id
+
+    elif message.animation:
+        media_type = "animation"
+        file_id = message.animation.file_id
+
+    elif message.sticker:
+        media_type = "sticker"
+        file_id = message.sticker.file_id
+
+    return media_type, file_id
+
+
+def media_name(media_type):
+
+    names = {
+        "text": "💬 Текст",
+        "photo": "📷 Фото",
+        "video": "🎥 Видео",
+        "voice": "🎤 Голосовое",
+        "video_note": "🎬 Кружок",
+        "document": "📄 Документ",
+        "audio": "🎵 Аудио",
+        "animation": "🖼 GIF",
+        "sticker": "🧩 Стикер",
+    }
+
+    return names.get(
+        media_type,
+        media_type
+    )
+
+
+def make_diff_html(
+    old_text,
+    new_text
+):
+
+    old_text = old_text or ""
+    new_text = new_text or ""
+
+    matcher = difflib.SequenceMatcher(
+        None,
+        old_text,
+        new_text
+    )
+
+    old_result = []
+    new_result = []
+
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+
+        if tag == "equal":
+
+            old_result.append(
+                safe(old_text[i1:i2])
+            )
+
+            new_result.append(
+                safe(new_text[j1:j2])
+            )
+
+        elif tag == "delete":
+
+            old_result.append(
+                f"<s>{safe(old_text[i1:i2])}</s>"
+            )
+
+        elif tag == "insert":
+
+            new_result.append(
+                safe(new_text[j1:j2])
+            )
+
+        elif tag == "replace":
+
+            old_result.append(
+                f"<s>{safe(old_text[i1:i2])}</s>"
+            )
+
+            new_result.append(
+                safe(new_text[j1:j2])
+            )
+
+    return (
+        "".join(old_result),
+        "".join(new_result)
+    )
+
+
+# =========================================================
+# MAIN MENU
+# =========================================================
+
+def main_keyboard():
+
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+
+            [
+                InlineKeyboardButton(
+                    text="🚀 Подключить Business",
+                    callback_data="connect_business"
+                )
+            ],
+
+            [
+                InlineKeyboardButton(
+                    text="🟦 Мой Business",
+                    callback_data="my_business"
+                )
+            ],
+
+            [
+                InlineKeyboardButton(
+                    text="🗑 Удалённые",
+                    callback_data="open_deleted"
+                ),
+                InlineKeyboardButton(
+                    text="ℹ️ Изменённые",
+                    callback_data="open_edited"
+                )
+            ],
+
+            [
+                InlineKeyboardButton(
+                    text="💬 Команды",
+                    callback_data="open_commands"
+                ),
+                InlineKeyboardButton(
+                    text="📊 Статистика",
+                    callback_data="open_stats"
+                )
+            ],
+
+            [
+                InlineKeyboardButton(
+                    text="🎬 Конвертер",
+                    callback_data="open_converter"
+                )
+            ],
+
+            [
+                InlineKeyboardButton(
+                    text="👥 Пригласить друга",
+                    callback_data="invite_friend"
+                )
+            ],
+
+            [
+                InlineKeyboardButton(
+                    text="⚙️ Настройки",
+                    callback_data="open_settings"
+                )
+            ],
+
+            [
+                InlineKeyboardButton(
+                    text="💎 Business Premium ↗",
+                    url=PREMIUM_URL
+                )
+            ],
+
+            [
+                InlineKeyboardButton(
+                    text="💡 Поддержка ↗",
+                    url=SUPPORT_URL
+                )
+            ]
+
+        ]
+    )
+
+
+def settings_keyboard(
+    delete_notifications,
+    save_media,
+    edit_notifications
+):
+
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+
+            [
+                InlineKeyboardButton(
+                    text=(
+                        "🗑 Удаления: "
+                        f"{'✅' if delete_notifications else '❌'}"
+                    ),
+                    callback_data="toggle_deletions"
+                )
+            ],
+
+            [
+                InlineKeyboardButton(
+                    text=(
+                        "📦 Медиа: "
+                        f"{'✅' if save_media else '❌'}"
+                    ),
+                    callback_data="toggle_media"
+                )
+            ],
+
+            [
+                InlineKeyboardButton(
+                    text=(
+                        "✏️ Изменения: "
+                        f"{'✅' if edit_notifications else '❌'}"
+                    ),
+                    callback_data="toggle_edits"
+                )
+            ],
+
+            [
+                InlineKeyboardButton(
+                    text="⬅️ Назад",
+                    callback_data="open_menu"
+                )
+            ]
+
+        ]
+    )
+
+
+def back_keyboard():
+
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="⬅️ Назад",
+                    callback_data="open_menu"
+                )
+            ]
+        ]
+    )
+
+
+def converter_keyboard():
+
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+
+            [
+                InlineKeyboardButton(
+                    text="🎥 Видео → кружок",
+                    callback_data="video_to_circle"
+                )
+            ],
+
+            [
+                InlineKeyboardButton(
+                    text="⬅️ Назад",
+                    callback_data="open_menu"
+                )
+            ]
+
+        ]
+    )
+
+
+def converter_wait_keyboard():
+
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="❌ Отмена",
+                    callback_data="cancel_converter"
+                )
+            ]
+        ]
+    )
+
+
+# =========================================================
+# MENU STATE
+# =========================================================
+
+def save_menu_state(
+    owner_id,
+    chat_id,
+    message_id
+):
+
+    cursor.execute("""
+        INSERT INTO menu_state (
+            owner_id,
+            chat_id,
+            message_id,
+            updated_at
+        )
+        VALUES (?, ?, ?, ?)
+
+        ON CONFLICT(owner_id)
+        DO UPDATE SET
+            chat_id = excluded.chat_id,
+            message_id = excluded.message_id,
+            updated_at = excluded.updated_at
+    """, (
+        owner_id,
+        chat_id,
+        message_id,
+        datetime.now(
+            timezone.utc
+        ).isoformat()
+    ))
+
+    db.commit()
+
+
+def get_menu_state(owner_id):
+
+    cursor.execute("""
+        SELECT
+            chat_id,
+            message_id
+        FROM menu_state
+        WHERE owner_id = ?
+    """, (
+        owner_id,
+    ))
+
+    return cursor.fetchone()
+
+
+# =========================================================
+# BUSINESS CONNECTION
+# =========================================================
+
+@dp.business_connection()
+async def business_connection_handler(
+    connection: BusinessConnection
+):
+
+    save_connection(connection)
+
+    print()
+    print("=" * 60)
+    print("🔗 BUSINESS CONNECTION")
+    print("=" * 60)
+    print("Connection:", connection.id)
+    print("Owner:", connection.user.id)
+    print("User Chat:", connection.user_chat_id)
+    print("Enabled:", connection.is_enabled)
+    print("=" * 60)
+
+
+# =========================================================
+# .SAVE
+# =========================================================
+
+@dp.business_message(
+    F.text == ".save"
+)
+async def save_command(
+    message: types.Message
+):
+
+    connection = await get_business_connection(
+        message.business_connection_id
+    )
+
+    if connection is None:
+        return
+
+    user_chat_id = connection.user_chat_id
+
+    reply = message.reply_to_message
+
+    if reply is None:
+
+        await bot.send_message(
+            chat_id=user_chat_id,
+            text=(
+                "❌ <b>Не найдено сообщение для сохранения.</b>\n\n"
+                "Ответь <code>.save</code> "
+                "на нужное сообщение."
+            ),
+            parse_mode="HTML"
+        )
+
+        return
+
+    if reply.photo:
+
+        try:
+
+            await bot.send_photo(
+                chat_id=user_chat_id,
+                photo=reply.photo[-1].file_id,
+                caption="💾 Сохранённое фото"
+            )
+
+        except Exception as error:
+
+            error_text = str(error)
+
+            if "SelfDestructingPhoto" in error_text:
+
+                await bot.send_message(
+                    chat_id=user_chat_id,
+                    text=(
+                        "⚠️ <b>Это одноразовое фото.</b>\n\n"
+                        "Telegram передал его как "
+                        "<code>SelfDestructingPhoto</code>, "
+                        "поэтому Bot API не разрешает "
+                        "повторно отправить его как обычное фото."
+                    ),
+                    parse_mode="HTML"
+                )
+
+            else:
+
+                await bot.send_message(
+                    chat_id=user_chat_id,
+                    text=(
+                        "❌ Не удалось сохранить фото.\n\n"
+                        f"<code>{safe(error)}</code>"
+                    ),
+                    parse_mode="HTML"
+                )
+
+        return
+
+    if reply.video:
+
+        try:
+
+            await bot.send_video(
+                chat_id=user_chat_id,
+                video=reply.video.file_id,
+                caption="💾 Сохранённое видео"
+            )
+
+        except Exception as error:
+
+            await bot.send_message(
+                chat_id=user_chat_id,
+                text=(
+                    "❌ Не удалось сохранить видео.\n\n"
+                    f"<code>{safe(error)}</code>"
+                ),
+                parse_mode="HTML"
+            )
+
+        return
+
+    await bot.send_message(
+        chat_id=user_chat_id,
+        text=(
+            "❌ В ответном сообщении "
+            "нет доступного медиа."
+        )
+    )
+
+
+# =========================================================
+# .SPAM
+# =========================================================
+
+@dp.business_message(
+    F.text.startswith(".spam")
+)
+async def spam_command(
+    message: types.Message
+):
+
+    connection_id = message.business_connection_id
+    chat_id = message.chat.id
+
+    connection = await get_business_connection(
+        connection_id
+    )
+
+    if connection is None:
+        return
+
+    owner_id = connection.user.id
+
+    save_connection(
+        connection,
+        last_chat_id=chat_id
+    )
+
+    parts = message.text.split(
+        maxsplit=2
+    )
+
+    if len(parts) < 3:
+
+        await bot.send_message(
+            chat_id=chat_id,
+            text=(
+                "❌ <b>Формат:</b>\n\n"
+                "<code>.spam N текст</code>\n\n"
+                "Пример:\n"
+                "<code>.spam 3 Привет</code>"
+            ),
+            parse_mode="HTML",
+            business_connection_id=connection_id
+        )
+
+        return
+
+    try:
+
+        count = int(parts[1])
+
+    except ValueError:
+
+        await bot.send_message(
+            chat_id=chat_id,
+            text="❌ N должно быть числом.",
+            business_connection_id=connection_id
+        )
+
+        return
+
+    text = parts[2].strip()
+
+    if count < 1 or count > MAX_SPAM_COUNT:
+
+        await bot.send_message(
+            chat_id=chat_id,
+            text=(
+                f"❌ Количество: "
+                f"от 1 до {MAX_SPAM_COUNT}."
+            ),
+            business_connection_id=connection_id
+        )
+
+        return
+
+    if owner_id in active_spam_tasks:
+        return
+
+    try:
+
+        await bot.delete_business_messages(
+            business_connection_id=connection_id,
+            message_ids=[message.message_id]
+        )
+
+    except Exception as error:
+
+        print(
+            "⚠️ Не удалось удалить .spam:",
+            repr(error)
+        )
+
+    stop_event = asyncio.Event()
+    active_spam_tasks[owner_id] = stop_event
+
+    try:
+
+        for _ in range(count):
+
+            if stop_event.is_set():
+                break
+
+            try:
+
+                result = await bot.send_message(
+                    chat_id=chat_id,
+                    text=text,
+                    business_connection_id=connection_id
+                )
+
+                cursor.execute("""
+                    INSERT INTO spam_messages (
+                        owner_id,
+                        connection_id,
+                        chat_id,
+                        message_id,
+                        created_at
+                    )
+                    VALUES (?, ?, ?, ?, ?)
+                """, (
+                    owner_id,
+                    connection_id,
+                    chat_id,
+                    result.message_id,
+                    datetime.now(
+                        timezone.utc
+                    ).isoformat()
+                ))
+
+                db.commit()
+
+                await asyncio.sleep(
+                    SPAM_DELAY
+                )
+
+            except Exception as error:
+
+                print(
+                    "❌ SPAM ERROR:",
+                    repr(error)
+                )
+
+                try:
+
+                    await bot.send_message(
+                        chat_id=connection.user_chat_id,
+                        text=(
+                            "❌ <b>SPAM ERROR</b>\n\n"
+                            f"<code>{safe(error)}</code>"
+                        ),
+                        parse_mode="HTML"
+                    )
+
+                except Exception:
+                    pass
+
+                break
+
+    finally:
+
+        active_spam_tasks.pop(
+            owner_id,
+            None
+        )
+
+
+# =========================================================
+# STOP SPAM
+# =========================================================
+
+@dp.callback_query(
+    lambda c: c.data == "stop_spam"
+)
+async def stop_spam(
+    callback: CallbackQuery
+):
+
+    owner_id = callback.from_user.id
+
+    task = active_spam_tasks.get(
+        owner_id
+    )
+
+    if task is None:
+
+        await callback.answer(
+            "Активного spam нет.",
+            show_alert=True
+        )
+
+        return
+
+    task.set()
+
+    await callback.answer(
+        "⏹ Останавливаю..."
+    )
+
+
+# =========================================================
+# BSPAM
+# =========================================================
+
+@dp.business_message(
+    F.text == ".bspam"
+)
+async def bspam_command(
+    message: types.Message
+):
+
+    connection_id = message.business_connection_id
+    chat_id = message.chat.id
+
+    connection = await get_business_connection(
+        connection_id
+    )
+
+    if connection is None:
+        return
+
+    owner_id = connection.user.id
+
+    cursor.execute("""
+        SELECT message_id
+        FROM spam_messages
+
+        WHERE owner_id = ?
+          AND connection_id = ?
+          AND chat_id = ?
+
+        ORDER BY id ASC
+    """, (
+        owner_id,
+        connection_id,
+        chat_id
+    ))
+
+    rows = cursor.fetchall()
+
+    message_ids = [
+        row[0]
+        for row in rows
+    ]
+
+    if not message_ids:
+        return
+
+    try:
+
+        await bot.delete_business_messages(
+            business_connection_id=connection_id,
+            message_ids=[message.message_id]
+        )
+
+    except Exception:
+        pass
+
+    for start in range(
+        0,
+        len(message_ids),
+        100
+    ):
+
+        chunk = message_ids[
+            start:start + 100
+        ]
+
+        try:
+
+            await bot.delete_business_messages(
+                business_connection_id=connection_id,
+                message_ids=chunk
+            )
+
+            placeholders = ",".join(
+                "?" for _ in chunk
+            )
+
+            cursor.execute(
+                f"""
+                DELETE FROM spam_messages
+
+                WHERE owner_id = ?
+
+                  AND connection_id = ?
+
+                  AND chat_id = ?
+
+                  AND message_id
+                  IN ({placeholders})
+                """,
+                [
+                    owner_id,
+                    connection_id,
+                    chat_id,
+                    *chunk
+                ]
+            )
+
+            db.commit()
+
+        except Exception as error:
+
+            print(
+                "❌ BSPAM ERROR:",
+                repr(error)
+            )
+
+
+# =========================================================
+# VIDEO CONVERTER MENU
+# =========================================================
+
+@dp.callback_query(
+    lambda c: c.data == "open_converter"
+)
+async def open_converter(
+    callback: CallbackQuery
+):
+
+    await callback.message.edit_text(
+        "🎬 <b>Конвертер</b>\n\n"
+        "Выберите действие:",
+        parse_mode="HTML",
+        reply_markup=converter_keyboard()
+    )
+
+    await callback.answer()
+
+
+# =========================================================
+# VIDEO → CIRCLE
+# =========================================================
+
+@dp.callback_query(
+    lambda c: c.data == "video_to_circle"
+)
+async def video_to_circle(
+    callback: CallbackQuery
+):
+
+    converter_users.add(
+        callback.from_user.id
+    )
+
+    await callback.message.edit_text(
+        "🎥 <b>Видео → кружок</b>\n\n"
+
+        "Пришлите видео, которое нужно "
+        "преобразовать в Telegram-кружок 🎬\n\n"
+
+        "⏱ Максимальная длительность: "
+        "<b>60 секунд</b>.\n\n"
+
+        "После отправки видео начнётся "
+        "автоматическая обработка.",
+
+        parse_mode="HTML",
+
+        reply_markup=converter_wait_keyboard()
+    )
+
+    await callback.answer()
+
+
+# =========================================================
+# CANCEL CONVERTER
+# =========================================================
+
+@dp.callback_query(
+    lambda c: c.data == "cancel_converter"
+)
+async def cancel_converter(
+    callback: CallbackQuery
+):
+
+    converter_users.discard(
+        callback.from_user.id
+    )
+
+    name = (
+        callback.from_user.first_name
+        or "друг"
+    )
+
+    await callback.message.edit_text(
+        "🗃 <b>BUSINESS ARCHIVE</b>\n\n"
+
+        f"Привет, <b>{safe(name)}</b>!\n\n"
+
+        "Выберите раздел:",
+
+        parse_mode="HTML",
+        reply_markup=main_keyboard()
+    )
+
+    await callback.answer(
+        "Конвертация отменена"
+    )
+
+
+# =========================================================
+# VIDEO CONVERTER
+# =========================================================
+
+@dp.message(
+    F.video
+)
+async def convert_video_handler(
+    message: types.Message
+):
+
+    user_id = message.from_user.id
+
+    # Пользователь не находится в режиме конвертации
+    if user_id not in converter_users:
+        return
+
+    converter_users.discard(
+        user_id
+    )
+
+    duration = (
+        message.video.duration
+        or 0
+    )
+
+    # -----------------------------------------------------
+    # Проверка длительности
+    # -----------------------------------------------------
+
+    if duration > MAX_VIDEO_DURATION:
+
+        await message.answer(
+            "❌ Видео слишком длинное.\n\n"
+            "Максимальная длительность для "
+            "кружка — <b>60 секунд</b>.",
+            parse_mode="HTML"
+        )
+
+        return
+
+    # -----------------------------------------------------
+    # Проверка размера
+    # -----------------------------------------------------
+
+    if message.video.file_size:
+
+        # 50 MB
+        if message.video.file_size > 50 * 1024 * 1024:
+
+            await message.answer(
+                "❌ Видео слишком большое.\n\n"
+                "Попробуй файл меньше 50 МБ."
+            )
+
+            return
+
+    unique_id = uuid.uuid4().hex
+
+    input_file = (
+        f"video_input_{unique_id}.mp4"
+    )
+
+    output_file = (
+        f"video_circle_{unique_id}.mp4"
+    )
+
+    try:
+
+        # -------------------------------------------------
+        # Индикатор
+        # -------------------------------------------------
+
+        status = await message.answer(
+            "⏳ <b>Конвертирую видео...</b>\n\n"
+            "🎥 Видео получено\n"
+            "⚙️ Обработка через FFmpeg",
+            parse_mode="HTML"
+        )
+
+        # -------------------------------------------------
+        # Получаем Telegram File
+        # -------------------------------------------------
+
+        telegram_file = await bot.get_file(
+            message.video.file_id
+        )
+
+        if not telegram_file.file_path:
+
+            await status.edit_text(
+                "❌ Telegram не вернул путь к файлу."
+            )
+
+            return
+
+        # -------------------------------------------------
+        # Скачиваем
+        # -------------------------------------------------
+
+        await bot.download_file(
+            telegram_file.file_path,
+            destination=input_file
+        )
+
+        # -------------------------------------------------
+        # FFmpeg
+        # -------------------------------------------------
+        #
+        # Делаем квадрат 640x640.
+        #
+        # Если видео вертикальное:
+        # обрезаются верх/низ.
+        #
+        # Если горизонтальное:
+        # обрезаются края.
+        #
+        # Сохраняем H.264 MP4.
+        # -------------------------------------------------
+
+        ffmpeg_command = [
+
+            "ffmpeg",
+
+            "-y",
+
+            "-i",
+            input_file,
+
+            "-vf",
+
+            (
+                "scale="
+                "640:640:"
+                "force_original_aspect_ratio=increase,"
+                "crop=640:640"
+            ),
+
+            "-c:v",
+            "libx264",
+
+            "-preset",
+            "veryfast",
+
+            "-crf",
+            "23",
+
+            "-pix_fmt",
+            "yuv420p",
+
+            "-an",
+
+            "-t",
+            "60",
+
+            "-movflags",
+            "+faststart",
+
+            output_file
+        ]
+
+        process = await asyncio.create_subprocess_exec(
+            *ffmpeg_command,
+
+            stdout=asyncio.subprocess.PIPE,
+
+            stderr=asyncio.subprocess.PIPE
+        )
+
+        stdout, stderr = await process.communicate()
+
+        if process.returncode != 0:
+
+            error_text = stderr.decode(
+                errors="ignore"
+            )
+
+            print(
+                "❌ FFMPEG ERROR:"
+            )
+
+            print(
+                error_text
+            )
+
+            await status.edit_text(
+                "❌ <b>FFmpeg не смог обработать видео.</b>\n\n"
+                f"<code>{safe(error_text[-1500:])}</code>",
+                parse_mode="HTML"
+            )
+
+            return
+
+        # -------------------------------------------------
+        # Проверяем выходной файл
+        # -------------------------------------------------
+
+        if not os.path.exists(
+            output_file
+        ):
+
+            await status.edit_text(
+                "❌ После обработки "
+                "файл не найден."
+            )
+
+            return
+
+        output_size = os.path.getsize(
+            output_file
+        )
+
+        print(
+            "✅ Конвертация завершена"
+        )
+
+        print(
+            "Output size:",
+            output_size
+        )
+
+        # -------------------------------------------------
+        # Отправляем как кружок
+        # -------------------------------------------------
+
+        video_note = FSInputFile(
+            output_file
+        )
+
+        # Удаляем статус
+        try:
+
+            await status.delete()
+
+        except Exception:
+            pass
+
+        await bot.send_video_note(
+            chat_id=message.chat.id,
+            video_note=video_note,
+            length=VIDEO_NOTE_SIZE,
+            duration=min(
+                duration,
+                MAX_VIDEO_DURATION
+            )
+        )
+
+        # -------------------------------------------------
+        # Чистое меню после конвертации
+        # -------------------------------------------------
+
+        await message.answer(
+            "✅ <b>Готово!</b>\n\n"
+            "Видео превращено в кружок 🎬",
+            parse_mode="HTML",
+            reply_markup=back_keyboard()
+        )
+
+    except FileNotFoundError:
+
+        await message.answer(
+            "❌ <b>FFmpeg не найден.</b>\n\n"
+            "Установи FFmpeg и добавь его "
+            "в PATH системы.",
+            parse_mode="HTML"
+        )
+
+    except Exception as error:
+
+        print(
+            "❌ CONVERTER ERROR:",
+            repr(error)
+        )
+
+        try:
+
+            await message.answer(
+                "❌ <b>Ошибка конвертации.</b>\n\n"
+                f"<code>{safe(error)}</code>",
+                parse_mode="HTML"
+            )
+
+        except Exception:
+            pass
+
+    finally:
+
+        # -------------------------------------------------
+        # Удаляем временные файлы
+        # -------------------------------------------------
+
+        for filename in [
+            input_file,
+            output_file
+        ]:
+
+            try:
+
+                if os.path.exists(
+                    filename
+                ):
+
+                    os.remove(
+                        filename
+                    )
+
+            except Exception as error:
+
+                print(
+                    "⚠️ Не удалось удалить:",
+                    filename,
+                    error
+                )
+
+
+# =========================================================
+# ORDINARY BUSINESS MESSAGE
+# =========================================================
+
+@dp.business_message()
+async def business_message_handler(
+    message: types.Message
+):
+
+    connection = await get_business_connection(
+        message.business_connection_id
+    )
+
+    if connection is None:
+        return
+
+    save_connection(
+        connection,
+        last_chat_id=message.chat.id
+    )
+
+    owner_id = connection.user.id
+
+    _, save_media, _ = get_settings(
+        owner_id
+    )
+
+    user_id = None
+    username = None
+    first_name = None
+    last_name = None
+
+    if message.from_user:
+
+        user_id = message.from_user.id
+        username = message.from_user.username
+        first_name = message.from_user.first_name
+        last_name = message.from_user.last_name
+
+    text = (
+        message.text
+        or message.caption
+        or ""
+    )
+
+    media_type, file_id = get_media_info(
+        message
+    )
+
+    if (
+        not save_media
+        and media_type != "text"
+    ):
+
+        media_type = "text"
+        file_id = None
+
+    cursor.execute("""
+        INSERT OR REPLACE INTO messages (
+
+            connection_id,
+            chat_id,
+            message_id,
+
+            user_id,
+            username,
+            first_name,
+            last_name,
+
+            text,
+            date,
+
+            media_type,
+            file_id,
+
+            deleted
+
+        )
+
+        VALUES (
+            ?, ?, ?,
+            ?, ?, ?, ?,
+            ?, ?,
+            ?, ?,
+            0
+        )
+    """, (
+        message.business_connection_id,
+        message.chat.id,
+        message.message_id,
+
+        user_id,
+        username,
+        first_name,
+        last_name,
+
+        text,
+        message.date.isoformat(),
+
+        media_type,
+        file_id
+    ))
+
+    db.commit()
+
+    print(
+        f"💬 Сохранено: "
+        f"{media_type} | "
+        f"{username or user_id} | "
+        f"{text}"
+    )
+
+
+# =========================================================
+# EDITED BUSINESS MESSAGE
+# =========================================================
+
+@dp.edited_business_message()
+async def edited_business_message_handler(
+    message: types.Message
+):
+
+    connection = await get_business_connection(
+        message.business_connection_id
+    )
+
+    if connection is None:
+        return
+
+    save_connection(
+        connection,
+        last_chat_id=message.chat.id
+    )
+
+    owner_id = connection.user.id
+    user_chat_id = connection.user_chat_id
+
+    _, save_media, edit_notifications = get_settings(
+        owner_id
+    )
+
+    cursor.execute("""
+        SELECT
+            user_id,
+            username,
+            first_name,
+            last_name,
+            text,
+            date,
+            media_type,
+            file_id
+        FROM messages
+
+        WHERE connection_id = ?
+          AND chat_id = ?
+          AND message_id = ?
+    """, (
+        message.business_connection_id,
+        message.chat.id,
+        message.message_id
+    ))
+
+    old_row = cursor.fetchone()
+
+    if old_row:
+
+        (
+            old_user_id,
+            old_username,
+            old_first_name,
+            old_last_name,
+            old_text,
+            old_date,
+            old_media_type,
+            old_file_id
+        ) = old_row
+
+    else:
+
+        old_user_id = None
+        old_username = None
+        old_first_name = None
+        old_last_name = None
+
+        old_text = ""
+        old_date = ""
+
+        old_media_type = "text"
+        old_file_id = None
+
+    new_text = (
+        message.text
+        or message.caption
+        or ""
+    )
+
+    new_media_type, new_file_id = get_media_info(
+        message
+    )
+
+    if (
+        not save_media
+        and new_media_type != "text"
+    ):
+
+        new_media_type = "text"
+        new_file_id = None
+
+    user_id = (
+        message.from_user.id
+        if message.from_user
+        else old_user_id
+    )
+
+    username = (
+        message.from_user.username
+        if message.from_user
+        else old_username
+    )
+
+    first_name = (
+        message.from_user.first_name
+        if message.from_user
+        else old_first_name
+    )
+
+    last_name = (
+        message.from_user.last_name
+        if message.from_user
+        else old_last_name
+    )
+
+    old_diff, new_diff = make_diff_html(
+        old_text,
+        new_text
+    )
+
+    name, _ = get_user_name(
+        first_name,
+        last_name,
+        username
+    )
+
+    notification = (
+        f"♻️ <b>{safe(name)}</b> "
+        f"изменил(а) сообщение\n\n"
+
+        f"❌ <b>Было:</b>\n"
+        f"<blockquote>"
+        f"{old_diff or '—'}"
+        f"</blockquote>\n\n"
+
+        f"✅ <b>Стало:</b>\n"
+        f"<blockquote>"
+        f"{new_diff or '—'}"
+        f"</blockquote>"
+    )
+
+    cursor.execute("""
+        INSERT OR REPLACE INTO messages (
+
+            connection_id,
+            chat_id,
+            message_id,
+
+            user_id,
+            username,
+            first_name,
+            last_name,
+
+            text,
+            date,
+
+            media_type,
+            file_id,
+
+            deleted
+        )
+
+        VALUES (
+            ?, ?, ?,
+            ?, ?, ?, ?,
+            ?, ?,
+            ?, ?,
+            0
+        )
+    """, (
+        message.business_connection_id,
+        message.chat.id,
+        message.message_id,
+
+        user_id,
+        username,
+        first_name,
+        last_name,
+
+        new_text,
+        message.date.isoformat(),
+
+        new_media_type,
+        new_file_id
+    ))
+
+    db.commit()
+
+    if not edit_notifications:
+        return
+
+    try:
+
+        await bot.send_message(
+            chat_id=user_chat_id,
+            text=notification,
+            parse_mode="HTML"
+        )
+
+    except Exception as error:
+
+        print(
+            "❌ EDIT ERROR:",
+            repr(error)
+        )
+
+
+# =========================================================
+# DELETED BUSINESS MESSAGES
+# =========================================================
+
+@dp.deleted_business_messages()
+async def deleted_business_messages_handler(
+    event: types.BusinessMessagesDeleted
+):
+
+    connection = await get_business_connection(
+        event.business_connection_id
+    )
+
+    if connection is None:
+        return
+
+    owner_id = connection.user.id
+    user_chat_id = connection.user_chat_id
+
+    delete_notifications, _, _ = get_settings(
+        owner_id
+    )
+
+    if not delete_notifications:
+        return
+
+    for message_id in event.message_ids:
+
+        cursor.execute("""
+            SELECT
+                user_id,
+                username,
+                first_name,
+                last_name,
+                text,
+                date,
+                media_type,
+                file_id
+
+            FROM messages
+
+            WHERE connection_id = ?
+              AND chat_id = ?
+              AND message_id = ?
+        """, (
+            event.business_connection_id,
+            event.chat.id,
+            message_id
+        ))
+
+        row = cursor.fetchone()
+
+        if not row:
+            continue
+
+        (
+            user_id,
+            username,
+            first_name,
+            last_name,
+            text,
+            date,
+            media_type,
+            file_id
+        ) = row
+
+        cursor.execute("""
+            UPDATE messages
+
+            SET deleted = 1
+
+            WHERE connection_id = ?
+              AND chat_id = ?
+              AND message_id = ?
+        """, (
+            event.business_connection_id,
+            event.chat.id,
+            message_id
+        ))
+
+        db.commit()
+
+        name, username_text = get_user_name(
+            first_name,
+            last_name,
+            username
+        )
+
+        header = (
+            "🗑 <b>Удалено сообщение</b>\n\n"
+
+            f"👤 <b>{safe(name)}</b>\n"
+            f"🔹 {safe(username_text)}\n"
+            f"🆔 <code>{user_id}</code>\n"
+            f"🕐 {safe(date)}\n\n"
+        )
+
+        if (
+            media_type == "text"
+            or not file_id
+        ):
+
+            try:
+
+                await bot.send_message(
+                    chat_id=user_chat_id,
+                    text=(
+                        header +
+                        "💬 <b>Сообщение:</b>\n"
+                        f"<blockquote>"
+                        f"{safe(text or '—')}"
+                        f"</blockquote>"
+                    ),
+                    parse_mode="HTML"
+                )
+
+            except Exception as error:
+
+                print(
+                    "❌ DELETE ERROR:",
+                    repr(error)
+                )
+
+            continue
+
+        caption = (
+            header +
+            "💬 <b>Текст:</b>\n"
+            f"{safe(text or '—')}"
+        )
+
+        try:
+
+            if media_type == "photo":
+
+                await bot.send_photo(
+                    user_chat_id,
+                    file_id,
+                    caption=caption,
+                    parse_mode="HTML"
+                )
+
+            elif media_type == "video":
+
+                await bot.send_video(
+                    user_chat_id,
+                    file_id,
+                    caption=caption,
+                    parse_mode="HTML"
+                )
+
+            elif media_type == "voice":
+
+                await bot.send_voice(
+                    user_chat_id,
+                    file_id,
+                    caption=caption,
+                    parse_mode="HTML"
+                )
+
+            elif media_type == "document":
+
+                await bot.send_document(
+                    user_chat_id,
+                    file_id,
+                    caption=caption,
+                    parse_mode="HTML"
+                )
+
+            elif media_type == "audio":
+
+                await bot.send_audio(
+                    user_chat_id,
+                    file_id,
+                    caption=caption,
+                    parse_mode="HTML"
+                )
+
+            elif media_type == "animation":
+
+                await bot.send_animation(
+                    user_chat_id,
+                    file_id,
+                    caption=caption,
+                    parse_mode="HTML"
+                )
+
+            elif media_type == "video_note":
+
+                await bot.send_video_note(
+                    user_chat_id,
+                    file_id
+                )
+
+                if text:
+
+                    await bot.send_message(
+                        user_chat_id,
+                        caption,
+                        parse_mode="HTML"
+                    )
+
+            elif media_type == "sticker":
+
+                await bot.send_sticker(
+                    user_chat_id,
+                    file_id
+                )
+
+                if text:
+
+                    await bot.send_message(
+                        user_chat_id,
+                        caption,
+                        parse_mode="HTML"
+                    )
+
+        except Exception as error:
+
+            print(
+                "❌ MEDIA DELETE ERROR:",
+                repr(error)
+            )
+
+
+# =========================================================
+# MAIN MENU COMMANDS
+# =========================================================
+
+@dp.message(Command("start"))
+@dp.message(Command("menu"))
+async def menu_command(
+    message: types.Message
+):
+
+    owner_id = message.from_user.id
+
+    try:
+        await message.delete()
+    except Exception:
+        pass
+
+    name = (
+        message.from_user.first_name
+        or "друг"
+    )
+
+    text = (
+        "🗃 <b>BUSINESS ARCHIVE</b>\n\n"
+
+        f"Привет, <b>{safe(name)}</b>!\n\n"
+
+        "Здесь можно настроить архиватор "
+        "и управлять его функциями.\n\n"
+
+        "Выберите раздел:"
+    )
+
+    state = get_menu_state(owner_id)
+
+    if state:
+
+        old_chat_id, old_message_id = state
+
+        try:
+
+            await bot.edit_message_text(
+                chat_id=old_chat_id,
+                message_id=old_message_id,
+                text=text,
+                parse_mode="HTML",
+                reply_markup=main_keyboard()
+            )
+
+            save_menu_state(
+                owner_id,
+                old_chat_id,
+                old_message_id
+            )
+
+            return
+
+        except Exception:
+            pass
+
+    sent = await message.answer(
+        text,
+        parse_mode="HTML",
+        reply_markup=main_keyboard()
+    )
+
+    save_menu_state(
+        owner_id,
+        message.chat.id,
+        sent.message_id
+    )
+
+
+# =========================================================
+# BACK TO MENU
+# =========================================================
+
+@dp.callback_query(
+    lambda c: c.data == "open_menu"
+)
+async def open_menu(
+    callback: CallbackQuery
+):
+
+    owner_id = callback.from_user.id
+
+    name = (
+        callback.from_user.first_name
+        or "друг"
+    )
+
+    text = (
+        "🗃 <b>BUSINESS ARCHIVE</b>\n\n"
+
+        f"Привет, <b>{safe(name)}</b>!\n\n"
+
+        "Здесь можно настроить архиватор "
+        "и управлять его функциями.\n\n"
+
+        "Выберите раздел:"
+    )
+
+    try:
+
+        await callback.message.edit_text(
+            text,
+            parse_mode="HTML",
+            reply_markup=main_keyboard()
+        )
+
+        save_menu_state(
+            owner_id,
+            callback.message.chat.id,
+            callback.message.message_id
+        )
+
+    except Exception as error:
+
+        print(
+            "❌ OPEN MENU ERROR:",
+            repr(error)
+        )
+
+    await callback.answer()
+
+
+# =========================================================
+# CONNECT BUSINESS
+# =========================================================
+
+@dp.callback_query(
+    lambda c: c.data == "connect_business"
+)
+async def connect_business(
+    callback: CallbackQuery
+):
+
+    await callback.message.edit_text(
+        "🚀 <b>Подключить Business</b>\n\n"
+
+        "Открой:\n"
+        "<b>Настройки → Telegram Business → Чат-боты</b>\n\n"
+
+        "Добавь этого бота и выдай нужные права.\n\n"
+
+        "После подключения архивирование "
+        "начнёт работать автоматически.",
+
+        parse_mode="HTML",
+        reply_markup=back_keyboard()
+    )
+
+    await callback.answer()
+
+
+# =========================================================
+# MY BUSINESS
+# =========================================================
+
+@dp.callback_query(
+    lambda c: c.data == "my_business"
+)
+async def my_business(
+    callback: CallbackQuery
+):
+
+    owner_id = callback.from_user.id
+
+    cursor.execute("""
+        SELECT
+            connection_id,
+            enabled
+
+        FROM business_connections
+
+        WHERE owner_id = ?
+
+        ORDER BY created_at DESC
+
+        LIMIT 1
+    """, (
+        owner_id,
+    ))
+
+    row = cursor.fetchone()
+
+    if row:
+
+        connection_id, enabled = row
+
+        status = (
+            "🟢 Подключён"
+            if enabled
+            else "🔴 Отключён"
+        )
+
+        text = (
+            "🟦 <b>Мой Business</b>\n\n"
+
+            f"{status}\n\n"
+
+            "✅ Архивирование\n"
+            "🗑 Удаления\n"
+            "✏️ Изменения\n"
+            "📦 Медиа\n"
+            "💾 .save\n"
+            "🚀 Business-команды"
+        )
+
+    else:
+
+        text = (
+            "🟦 <b>Мой Business</b>\n\n"
+
+            "❌ Business пока не найден.\n\n"
+
+            "Отправь новое сообщение "
+            "в Business-чат."
+        )
+
+    await callback.message.edit_text(
+        text,
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[
+
+                [
+                    InlineKeyboardButton(
+                        text="🔄 Проверить",
+                        callback_data="my_business"
+                    )
+                ],
+
+                [
+                    InlineKeyboardButton(
+                        text="⬅️ Назад",
+                        callback_data="open_menu"
+                    )
+                ]
+
+            ]
+        )
+    )
+
+    await callback.answer()
+
+
+# =========================================================
+# COMMANDS PAGE
+# =========================================================
+
+@dp.callback_query(
+    lambda c: c.data == "open_commands"
+)
+async def open_commands(
+    callback: CallbackQuery
+):
+
+    await callback.message.edit_text(
+        "💬 <b>Команды</b>\n\n"
+
+        "<code>.save</code>\n"
+        "Сохранить доступное медиа из reply.\n\n"
+
+        "<code>.spam N текст</code>\n"
+        "Отправить N сообщений.\n\n"
+
+        "<code>.bspam</code>\n"
+        "Удалить сообщения от .spam.\n\n"
+
+        "<code>/menu</code>\n"
+        "Главное меню.\n\n"
+
+        "<code>/settings</code>\n"
+        "Настройки.\n\n"
+
+        "<code>/stats</code>\n"
+        "Статистика.\n\n"
+
+        "<code>/deleted</code>\n"
+        "Удалённые сообщения.",
+
+        parse_mode="HTML",
+        reply_markup=back_keyboard()
+    )
+
+    await callback.answer()
+
+
+# =========================================================
+# EDITED PAGE
+# =========================================================
+
+@dp.callback_query(
+    lambda c: c.data == "open_edited"
+)
+async def open_edited(
+    callback: CallbackQuery
+):
+
+    await callback.message.edit_text(
+        "ℹ️ <b>Изменённые сообщения</b>\n\n"
+
+        "При изменении сообщения бот "
+        "показывает старую и новую версии.\n\n"
+
+        "Изменённая часть старой версии "
+        "зачёркивается.",
+
+        parse_mode="HTML",
+        reply_markup=back_keyboard()
+    )
+
+    await callback.answer()
+
+
+# =========================================================
+# SETTINGS
+# =========================================================
+
+@dp.callback_query(
+    lambda c: c.data == "open_settings"
+)
+async def open_settings(
+    callback: CallbackQuery
+):
+
+    owner_id = callback.from_user.id
+
+    (
+        delete_notifications,
+        save_media,
+        edit_notifications
+    ) = get_settings(owner_id)
+
+    await callback.message.edit_text(
+        "⚙️ <b>Настройки</b>\n\n"
+
+        f"🗑 Удаления: "
+        f"{'✅' if delete_notifications else '❌'}\n"
+
+        f"📦 Медиа: "
+        f"{'✅' if save_media else '❌'}\n"
+
+        f"✏️ Изменения: "
+        f"{'✅' if edit_notifications else '❌'}",
+
+        parse_mode="HTML",
+
+        reply_markup=settings_keyboard(
+            delete_notifications,
+            save_media,
+            edit_notifications
+        )
+    )
+
+    await callback.answer()
+
+
+@dp.callback_query(
+    lambda c: c.data == "toggle_deletions"
+)
+async def toggle_deletions(
+    callback: CallbackQuery
+):
+
+    owner_id = callback.from_user.id
+
+    (
+        delete_notifications,
+        save_media,
+        edit_notifications
+    ) = get_settings(owner_id)
+
+    new_value = not delete_notifications
+
+    cursor.execute("""
+        UPDATE settings
+        SET delete_notifications = ?
+        WHERE owner_id = ?
+    """, (
+        int(new_value),
+        owner_id
+    ))
+
+    db.commit()
+
+    await callback.message.edit_reply_markup(
+        reply_markup=settings_keyboard(
+            new_value,
+            save_media,
+            edit_notifications
+        )
+    )
+
+    await callback.answer(
+        "Удаления включены ✅"
+        if new_value
+        else "Удаления выключены ❌"
+    )
+
+
+@dp.callback_query(
+    lambda c: c.data == "toggle_media"
+)
+async def toggle_media(
+    callback: CallbackQuery
+):
+
+    owner_id = callback.from_user.id
+
+    (
+        delete_notifications,
+        save_media,
+        edit_notifications
+    ) = get_settings(owner_id)
+
+    new_value = not save_media
+
+    cursor.execute("""
+        UPDATE settings
+        SET save_media = ?
+        WHERE owner_id = ?
+    """, (
+        int(new_value),
+        owner_id
+    ))
+
+    db.commit()
+
+    await callback.message.edit_reply_markup(
+        reply_markup=settings_keyboard(
+            delete_notifications,
+            new_value,
+            edit_notifications
+        )
+    )
+
+    await callback.answer(
+        "Медиа включено ✅"
+        if new_value
+        else "Медиа выключено ❌"
+    )
+
+
+@dp.callback_query(
+    lambda c: c.data == "toggle_edits"
+)
+async def toggle_edits(
+    callback: CallbackQuery
+):
+
+    owner_id = callback.from_user.id
+
+    (
+        delete_notifications,
+        save_media,
+        edit_notifications
+    ) = get_settings(owner_id)
+
+    new_value = not edit_notifications
+
+    cursor.execute("""
+        UPDATE settings
+        SET edit_notifications = ?
+        WHERE owner_id = ?
+    """, (
+        int(new_value),
+        owner_id
+    ))
+
+    db.commit()
+
+    await callback.message.edit_reply_markup(
+        reply_markup=settings_keyboard(
+            delete_notifications,
+            save_media,
+            new_value
+        )
+    )
+
+    await callback.answer(
+        "Изменения включены ✅"
+        if new_value
+        else "Изменения выключены ❌"
+    )
+
+
+# =========================================================
+# STATISTICS
+# =========================================================
+
+@dp.callback_query(
+    lambda c: c.data == "open_stats"
+)
+async def open_stats(
+    callback: CallbackQuery
+):
+
+    owner_id = callback.from_user.id
+
+    cursor.execute("""
+        SELECT COUNT(*)
+        FROM messages m
+        INNER JOIN business_connections b
+        ON m.connection_id = b.connection_id
+        WHERE b.owner_id = ?
+    """, (
+        owner_id,
+    ))
+
+    total = cursor.fetchone()[0]
+
+    cursor.execute("""
+        SELECT COUNT(*)
+        FROM messages m
+        INNER JOIN business_connections b
+        ON m.connection_id = b.connection_id
+        WHERE b.owner_id = ?
+          AND m.deleted = 1
+    """, (
+        owner_id,
+    ))
+
+    deleted = cursor.fetchone()[0]
+
+    cursor.execute("""
+        SELECT COUNT(*)
+        FROM messages m
+        INNER JOIN business_connections b
+        ON m.connection_id = b.connection_id
+        WHERE b.owner_id = ?
+          AND m.media_type != 'text'
+    """, (
+        owner_id,
+    ))
+
+    media = cursor.fetchone()[0]
+
+    await callback.message.edit_text(
+        "📊 <b>Статистика</b>\n\n"
+
+        f"💬 Сообщений: <b>{total}</b>\n"
+        f"🗑 Удалённых: <b>{deleted}</b>\n"
+        f"📦 Медиа: <b>{media}</b>",
+
+        parse_mode="HTML",
+        reply_markup=back_keyboard()
+    )
+
+    await callback.answer()
+
+
+# =========================================================
+# DELETED
+# =========================================================
+
+@dp.callback_query(
+    lambda c: c.data == "open_deleted"
+)
+async def open_deleted(
+    callback: CallbackQuery
+):
+
+    owner_id = callback.from_user.id
+
+    cursor.execute("""
+        SELECT
+            m.first_name,
+            m.last_name,
+            m.username,
+            m.text,
+            m.date,
+            m.media_type
+
+        FROM messages m
+
+        INNER JOIN business_connections b
+        ON m.connection_id = b.connection_id
+
+        WHERE b.owner_id = ?
+          AND m.deleted = 1
+
+        ORDER BY m.id DESC
+
+        LIMIT 10
+    """, (
+        owner_id,
+    ))
+
+    rows = cursor.fetchall()
+
+    if not rows:
+
+        text = (
+            "🗑 <b>Последние удаления</b>\n\n"
+            "Удалённых сообщений пока нет."
+        )
+
+    else:
+
+        text = (
+            "🗑 <b>Последние удаления</b>\n\n"
+        )
+
+        for row in rows:
+
+            (
+                first_name,
+                last_name,
+                username,
+                msg_text,
+                date,
+                media_type
+            ) = row
+
+            name, username_text = get_user_name(
+                first_name,
+                last_name,
+                username
+            )
+
+            text += (
+                f"👤 <b>{safe(name)}</b>\n"
+                f"🔹 {safe(username_text)}\n"
+                f"📦 {safe(media_name(media_type))}\n"
+                f"💬 {safe(msg_text or '—')}\n"
+                f"🕐 {safe(date)}\n\n"
+            )
+
+    await callback.message.edit_text(
+        text,
+        parse_mode="HTML",
+        reply_markup=back_keyboard()
+    )
+
+    await callback.answer()
+
+
+# =========================================================
+# INVITE
+# =========================================================
+
+@dp.callback_query(
+    lambda c: c.data == "invite_friend"
+)
+async def invite_friend(
+    callback: CallbackQuery
+):
+
+    try:
+
+        me = await bot.get_me()
+
+        link = (
+            f"https://t.me/{me.username}"
+            f"?start=ref_{callback.from_user.id}"
+        )
+
+        await callback.message.edit_text(
+            "👥 <b>Пригласить друга</b>\n\n"
+
+            "Отправь другу эту ссылку:\n\n"
+
+            f"<code>{safe(link)}</code>",
+
+            parse_mode="HTML",
+            reply_markup=back_keyboard()
+        )
+
+    except Exception as error:
+
+        print(
+            "❌ Invite error:",
+            repr(error)
+        )
+
+    await callback.answer()
+
+
+# =========================================================
+# COMMANDS IN PRIVATE CHAT
+# =========================================================
+
+@dp.message(Command("settings"))
+async def private_settings_command(
+    message: types.Message
+):
+
+    try:
+        await message.delete()
+    except Exception:
+        pass
+
+    owner_id = message.from_user.id
+
+    (
+        delete_notifications,
+        save_media,
+        edit_notifications
+    ) = get_settings(owner_id)
+
+    text = (
+        "⚙️ <b>Настройки</b>\n\n"
+
+        f"🗑 Удаления: "
+        f"{'✅' if delete_notifications else '❌'}\n"
+
+        f"📦 Медиа: "
+        f"{'✅' if save_media else '❌'}\n"
+
+        f"✏️ Изменения: "
+        f"{'✅' if edit_notifications else '❌'}"
+    )
+
+    state = get_menu_state(owner_id)
+
+    if state:
+
+        old_chat_id, old_message_id = state
+
+        try:
+
+            await bot.edit_message_text(
+                chat_id=old_chat_id,
+                message_id=old_message_id,
+                text=text,
+                parse_mode="HTML",
+                reply_markup=settings_keyboard(
+                    delete_notifications,
+                    save_media,
+                    edit_notifications
+                )
+            )
+
+            return
+
+        except Exception:
+            pass
+
+    sent = await message.answer(
+        text,
+        parse_mode="HTML",
+        reply_markup=settings_keyboard(
+            delete_notifications,
+            save_media,
+            edit_notifications
+        )
+    )
+
+    save_menu_state(
+        owner_id,
+        message.chat.id,
+        sent.message_id
+    )
+
+
+@dp.message(Command("stats"))
+async def private_stats_command(
+    message: types.Message
+):
+
+    try:
+        await message.delete()
+    except Exception:
+        pass
+
+    owner_id = message.from_user.id
+
+    cursor.execute("""
+        SELECT COUNT(*)
+        FROM messages m
+        INNER JOIN business_connections b
+        ON m.connection_id = b.connection_id
+        WHERE b.owner_id = ?
+    """, (
+        owner_id,
+    ))
+
+    total = cursor.fetchone()[0]
+
+    cursor.execute("""
+        SELECT COUNT(*)
+        FROM messages m
+        INNER JOIN business_connections b
+        ON m.connection_id = b.connection_id
+        WHERE b.owner_id = ?
+          AND m.deleted = 1
+    """, (
+        owner_id,
+    ))
+
+    deleted = cursor.fetchone()[0]
+
+    cursor.execute("""
+        SELECT COUNT(*)
+        FROM messages m
+        INNER JOIN business_connections b
+        ON m.connection_id = b.connection_id
+        WHERE b.owner_id = ?
+          AND m.media_type != 'text'
+    """, (
+        owner_id,
+    ))
+
+    media = cursor.fetchone()[0]
+
+    text = (
+        "📊 <b>Статистика</b>\n\n"
+
+        f"💬 Сообщений: <b>{total}</b>\n"
+        f"🗑 Удалённых: <b>{deleted}</b>\n"
+        f"📦 Медиа: <b>{media}</b>"
+    )
+
+    state = get_menu_state(owner_id)
+
+    if state:
+
+        old_chat_id, old_message_id = state
+
+        try:
+
+            await bot.edit_message_text(
+                chat_id=old_chat_id,
+                message_id=old_message_id,
+                text=text,
+                parse_mode="HTML",
+                reply_markup=back_keyboard()
+            )
+
+            return
+
+        except Exception:
+            pass
+
+    sent = await message.answer(
+        text,
+        parse_mode="HTML",
+        reply_markup=back_keyboard()
+    )
+
+    save_menu_state(
+        owner_id,
+        message.chat.id,
+        sent.message_id
+    )
+
+
+@dp.message(Command("deleted"))
+async def private_deleted_command(
+    message: types.Message
+):
+
+    try:
+        await message.delete()
+    except Exception:
+        pass
+
+    owner_id = message.from_user.id
+
+    cursor.execute("""
+        SELECT
+            m.first_name,
+            m.last_name,
+            m.username,
+            m.text,
+            m.date,
+            m.media_type
+
+        FROM messages m
+
+        INNER JOIN business_connections b
+        ON m.connection_id = b.connection_id
+
+        WHERE b.owner_id = ?
+          AND m.deleted = 1
+
+        ORDER BY m.id DESC
+
+        LIMIT 10
+    """, (
+        owner_id,
+    ))
+
+    rows = cursor.fetchall()
+
+    if not rows:
+
+        text = (
+            "🗑 <b>Последние удаления</b>\n\n"
+            "Удалённых сообщений пока нет."
+        )
+
+    else:
+
+        text = (
+            "🗑 <b>Последние удаления</b>\n\n"
+        )
+
+        for row in rows:
+
+            (
+                first_name,
+                last_name,
+                username,
+                msg_text,
+                date,
+                media_type
+            ) = row
+
+            name, username_text = get_user_name(
+                first_name,
+                last_name,
+                username
+            )
+
+            text += (
+                f"👤 <b>{safe(name)}</b>\n"
+                f"🔹 {safe(username_text)}\n"
+                f"📦 {safe(media_name(media_type))}\n"
+                f"💬 {safe(msg_text or '—')}\n"
+                f"🕐 {safe(date)}\n\n"
+            )
+
+    state = get_menu_state(owner_id)
+
+    if state:
+
+        old_chat_id, old_message_id = state
+
+        try:
+
+            await bot.edit_message_text(
+                chat_id=old_chat_id,
+                message_id=old_message_id,
+                text=text,
+                parse_mode="HTML",
+                reply_markup=back_keyboard()
+            )
+
+            return
+
+        except Exception:
+            pass
+
+    sent = await message.answer(
+        text,
+        parse_mode="HTML",
+        reply_markup=back_keyboard()
+    )
+
+    save_menu_state(
+        owner_id,
+        message.chat.id,
+        sent.message_id
+    )
+
+
+# =========================================================
+# MAIN
+# =========================================================
+
+async def main():
+
+    print()
+    print("=" * 60)
+    print("🚀 BUSINESS ARCHIVE ЗАПУЩЕН")
+    print("=" * 60)
+    print()
+
+    await dp.start_polling(bot)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
