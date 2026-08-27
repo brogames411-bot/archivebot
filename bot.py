@@ -638,14 +638,6 @@ def main_keyboard(user_id=None):
     ])
 
 
-    if ADMIN_ID and user_id == ADMIN_ID:
-        rows.append([
-            InlineKeyboardButton(
-                text="📋 Логи",
-                callback_data="open_admin_logs"
-            )
-        ])
-
 
     return InlineKeyboardMarkup(
         inline_keyboard=rows
