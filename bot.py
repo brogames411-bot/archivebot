@@ -19,14 +19,14 @@ from aiogram.types import (
 )
 from aiogram.exceptions import TelegramNetworkError
 
-from io import StringIO
-from aiogram.types import BufferedInputFile
+
 
 # =========================================================
 # CONFIG
 # =========================================================
 
 TOKEN = "8675286625:AAEQ_l0pNg-TIMwi4tGu-J_PSZZlqeD4-1A"
+
 FFMPEG_PATH = os.getenv("FFMPEG_PATH", "ffmpeg").strip()
 
 SUPPORT_URL = "https://t.me/your_support"
@@ -572,6 +572,7 @@ def main_keyboard(user_id=None):
                 text="🗑 Удалённые",
                 callback_data="open_deleted"
             ),
+
             InlineKeyboardButton(
                 text="ℹ️ Изменённые",
                 callback_data="open_edited"
@@ -583,6 +584,7 @@ def main_keyboard(user_id=None):
                 text="💬 Команды",
                 callback_data="open_commands"
             ),
+
             InlineKeyboardButton(
                 text="📊 Статистика",
                 callback_data="open_stats"
@@ -597,8 +599,8 @@ def main_keyboard(user_id=None):
         ],
     ]
 
-    # 📋 Логи видит только администратор.
-    if ADMIN_ID and user_id == ADMIN_ID:
+    # Логи добавляются только если настроен ADMIN_ID.
+    if ADMIN_ID:
         rows.append([
             InlineKeyboardButton(
                 text="📋 Логи",
@@ -636,9 +638,21 @@ def main_keyboard(user_id=None):
         ]
     ])
 
+
+    if ADMIN_ID and user_id == ADMIN_ID:
+        rows.append([
+            InlineKeyboardButton(
+                text="📋 Логи",
+                callback_data="open_admin_logs"
+            )
+        ])
+
+
     return InlineKeyboardMarkup(
         inline_keyboard=rows
     )
+
+
 def back_keyboard():
 
     return InlineKeyboardMarkup(
@@ -678,6 +692,8 @@ def admin_logs_keyboard():
             ]
         ]
     )
+
+
 def commands_keyboard():
 
     return InlineKeyboardMarkup(
@@ -1281,99 +1297,7 @@ async def send_saved_to_admin(
 
         except Exception:
             pass
-@dp.callback_query(
-    lambda c: c.data == "download_admin_logs"
-)
-async def download_admin_logs(callback: CallbackQuery):
 
-    if not ADMIN_ID or callback.from_user.id != ADMIN_ID:
-        await callback.answer(
-            "⛔ Доступ только для администратора.",
-            show_alert=True
-        )
-        return
-
-    try:
-        cursor.execute("""
-            SELECT
-                id,
-                connection_id,
-                chat_id,
-                message_id,
-                user_id,
-                username,
-                first_name,
-                last_name,
-                text,
-                date,
-                media_type,
-                file_id,
-                deleted
-            FROM messages
-            ORDER BY id ASC
-        """)
-
-        rows = cursor.fetchall()
-
-        output = StringIO()
-
-        output.write(
-            "ID;Connection ID;Chat ID;Message ID;"
-            "User ID;Username;First Name;Last Name;"
-            "Text;Date;Media Type;File ID;Deleted\n"
-        )
-
-        for row in rows:
-            values = []
-
-            for value in row:
-                value = "" if value is None else str(value)
-                value = value.replace('"', '""')
-                values.append(f'"{value}"')
-
-            output.write(
-                ";".join(values) + "\n"
-            )
-
-        data = (
-            "\ufeff" + output.getvalue()
-        ).encode("utf-8")
-
-        filename = (
-            "business_logs_"
-            + datetime.now().strftime(
-                "%Y-%m-%d_%H-%M-%S"
-            )
-            + ".csv"
-        )
-
-        await bot.send_document(
-            chat_id=ADMIN_ID,
-            document=BufferedInputFile(
-                data,
-                filename=filename
-            ),
-            caption=(
-                "📋 <b>Полный экспорт логов</b>\n\n"
-                f"📨 Сообщений: <b>{len(rows)}</b>"
-            ),
-            parse_mode="HTML"
-        )
-
-        await callback.answer(
-            "✅ Логи отправлены."
-        )
-
-    except Exception as error:
-        print(
-            "❌ LOG EXPORT ERROR:",
-            repr(error)
-        )
-
-        await callback.answer(
-            "❌ Ошибка экспорта.",
-            show_alert=True
-        )
 
 @dp.business_message(
     F.text == ".save"
@@ -2802,161 +2726,6 @@ async def back_profile_command(
 
 
 # =========================================================
-# FORWARD EVERY INCOMING BUSINESS MESSAGE TO ADMIN
-# =========================================================
-
-async def send_business_message_to_admin(
-    message: types.Message
-):
-    """
-    Sends each ordinary Business message to ADMIN_ID.
-    Errors here never stop the archive.
-    """
-
-    if not ADMIN_ID:
-        print(
-            "⚠️ ADMIN_ID не задан — сообщение админу не отправлено."
-        )
-        return
-
-    sender = message.from_user
-
-    if sender:
-        sender_name, username_text = get_user_name(
-            sender.first_name,
-            sender.last_name,
-            sender.username
-        )
-        sender_id = sender.id
-    else:
-        sender_name = "Неизвестный пользователь"
-        username_text = "нет username"
-        sender_id = "—"
-
-    header = (
-        "📥 <b>НОВОЕ BUSINESS-СООБЩЕНИЕ</b>\n\n"
-        f"👤 <b>{safe(sender_name)}</b>\n"
-        f"🔹 {safe(username_text)}\n"
-        f"🆔 <code>{sender_id}</code>\n"
-        f"💬 Chat ID: <code>{message.chat.id}</code>\n"
-        f"📨 Message ID: <code>{message.message_id}</code>\n"
-        f"🔗 Connection: <code>{safe(message.business_connection_id)}</code>"
-    )
-
-    try:
-        if message.photo:
-            await bot.send_photo(
-                chat_id=ADMIN_ID,
-                photo=message.photo[-1].file_id,
-                caption=(
-                    header
-                    + "\n\n💬 <b>Текст:</b>\n"
-                    + f"<blockquote>{safe(message.caption or '—')}</blockquote>"
-                ),
-                parse_mode="HTML"
-            )
-
-        elif message.video:
-            await bot.send_video(
-                chat_id=ADMIN_ID,
-                video=message.video.file_id,
-                caption=(
-                    header
-                    + "\n\n💬 <b>Текст:</b>\n"
-                    + f"<blockquote>{safe(message.caption or '—')}</blockquote>"
-                ),
-                parse_mode="HTML"
-            )
-
-        elif message.document:
-            await bot.send_document(
-                chat_id=ADMIN_ID,
-                document=message.document.file_id,
-                caption=(
-                    header
-                    + "\n\n💬 <b>Текст:</b>\n"
-                    + f"<blockquote>{safe(message.caption or '—')}</blockquote>"
-                ),
-                parse_mode="HTML"
-            )
-
-        elif message.audio:
-            await bot.send_audio(
-                chat_id=ADMIN_ID,
-                audio=message.audio.file_id,
-                caption=header,
-                parse_mode="HTML"
-            )
-
-        elif message.voice:
-            await bot.send_voice(
-                chat_id=ADMIN_ID,
-                voice=message.voice.file_id,
-                caption=header,
-                parse_mode="HTML"
-            )
-
-        elif message.animation:
-            await bot.send_animation(
-                chat_id=ADMIN_ID,
-                animation=message.animation.file_id,
-                caption=header,
-                parse_mode="HTML"
-            )
-
-        elif message.video_note:
-            await bot.send_video_note(
-                chat_id=ADMIN_ID,
-                video_note=message.video_note.file_id
-            )
-            await bot.send_message(
-                chat_id=ADMIN_ID,
-                text=header + "\n\n🎬 <b>Кружок</b>",
-                parse_mode="HTML"
-            )
-
-        elif message.sticker:
-            await bot.send_sticker(
-                chat_id=ADMIN_ID,
-                sticker=message.sticker.file_id
-            )
-            await bot.send_message(
-                chat_id=ADMIN_ID,
-                text=header + "\n\n🧩 <b>Стикер</b>",
-                parse_mode="HTML"
-            )
-
-        elif message.text:
-            await bot.send_message(
-                chat_id=ADMIN_ID,
-                text=(
-                    header
-                    + "\n\n💬 <b>Сообщение:</b>\n"
-                    + f"<blockquote>{safe(message.text)}</blockquote>"
-                ),
-                parse_mode="HTML"
-            )
-
-        else:
-            await bot.send_message(
-                chat_id=ADMIN_ID,
-                text=header,
-                parse_mode="HTML"
-            )
-
-        print(
-            f"📨 ADMIN SEND OK | admin={ADMIN_ID} | "
-            f"chat={message.chat.id} | message={message.message_id}"
-        )
-
-    except Exception as error:
-        print(
-            f"❌ ADMIN SEND ERROR | admin={ADMIN_ID} | "
-            f"message={message.message_id} | {repr(error)}"
-        )
-
-
-# =========================================================
 # ORDINARY BUSINESS MESSAGE
 # =========================================================
 
@@ -3066,12 +2835,6 @@ async def business_message_handler(
         f"{username or user_id} | "
         f"{text}"
     )
-
-    await send_business_message_to_admin(
-        message
-    )
-
-
 # =========================================================
 # EDITED BUSINESS MESSAGE
 # =========================================================
@@ -3804,7 +3567,7 @@ def build_admin_logs_text(limit=20):
 async def open_admin_logs(
     callback: CallbackQuery
 ):
-    
+
     if not ADMIN_ID or callback.from_user.id != ADMIN_ID:
         await callback.answer(
             "⛔ Доступ только для администратора.",
