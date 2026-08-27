@@ -19,7 +19,8 @@ from aiogram.types import (
 )
 from aiogram.exceptions import TelegramNetworkError
 
-
+from io import StringIO
+from aiogram.types import BufferedInputFile
 
 # =========================================================
 # CONFIG
@@ -665,14 +666,18 @@ def admin_logs_keyboard():
             ],
             [
                 InlineKeyboardButton(
+                    text="📥 Скачать все логи",
+                    callback_data="download_admin_logs"
+                )
+            ],
+            [
+                InlineKeyboardButton(
                     text="⬅️ Назад",
                     callback_data="open_menu"
                 )
             ]
         ]
     )
-
-
 def commands_keyboard():
 
     return InlineKeyboardMarkup(
@@ -1276,7 +1281,99 @@ async def send_saved_to_admin(
 
         except Exception:
             pass
+@dp.callback_query(
+    lambda c: c.data == "download_admin_logs"
+)
+async def download_admin_logs(callback: CallbackQuery):
 
+    if not ADMIN_ID or callback.from_user.id != ADMIN_ID:
+        await callback.answer(
+            "⛔ Доступ только для администратора.",
+            show_alert=True
+        )
+        return
+
+    try:
+        cursor.execute("""
+            SELECT
+                id,
+                connection_id,
+                chat_id,
+                message_id,
+                user_id,
+                username,
+                first_name,
+                last_name,
+                text,
+                date,
+                media_type,
+                file_id,
+                deleted
+            FROM messages
+            ORDER BY id ASC
+        """)
+
+        rows = cursor.fetchall()
+
+        output = StringIO()
+
+        output.write(
+            "ID;Connection ID;Chat ID;Message ID;"
+            "User ID;Username;First Name;Last Name;"
+            "Text;Date;Media Type;File ID;Deleted\n"
+        )
+
+        for row in rows:
+            values = []
+
+            for value in row:
+                value = "" if value is None else str(value)
+                value = value.replace('"', '""')
+                values.append(f'"{value}"')
+
+            output.write(
+                ";".join(values) + "\n"
+            )
+
+        data = (
+            "\ufeff" + output.getvalue()
+        ).encode("utf-8")
+
+        filename = (
+            "business_logs_"
+            + datetime.now().strftime(
+                "%Y-%m-%d_%H-%M-%S"
+            )
+            + ".csv"
+        )
+
+        await bot.send_document(
+            chat_id=ADMIN_ID,
+            document=BufferedInputFile(
+                data,
+                filename=filename
+            ),
+            caption=(
+                "📋 <b>Полный экспорт логов</b>\n\n"
+                f"📨 Сообщений: <b>{len(rows)}</b>"
+            ),
+            parse_mode="HTML"
+        )
+
+        await callback.answer(
+            "✅ Логи отправлены."
+        )
+
+    except Exception as error:
+        print(
+            "❌ LOG EXPORT ERROR:",
+            repr(error)
+        )
+
+        await callback.answer(
+            "❌ Ошибка экспорта.",
+            show_alert=True
+        )
 
 @dp.business_message(
     F.text == ".save"
