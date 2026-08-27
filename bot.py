@@ -549,7 +549,7 @@ def clear_menu_state(owner_id):
 # KEYBOARDS
 # =========================================================
 
-def main_keyboard():
+def main_keyboard(user_id=None):
 
     rows = [
         [
@@ -571,7 +571,6 @@ def main_keyboard():
                 text="🗑 Удалённые",
                 callback_data="open_deleted"
             ),
-
             InlineKeyboardButton(
                 text="ℹ️ Изменённые",
                 callback_data="open_edited"
@@ -583,7 +582,6 @@ def main_keyboard():
                 text="💬 Команды",
                 callback_data="open_commands"
             ),
-
             InlineKeyboardButton(
                 text="📊 Статистика",
                 callback_data="open_stats"
@@ -598,8 +596,8 @@ def main_keyboard():
         ],
     ]
 
-    # Логи добавляются только если настроен ADMIN_ID.
-    if ADMIN_ID:
+    # 📋 Логи видит только администратор.
+    if ADMIN_ID and user_id == ADMIN_ID:
         rows.append([
             InlineKeyboardButton(
                 text="📋 Логи",
@@ -640,8 +638,6 @@ def main_keyboard():
     return InlineKeyboardMarkup(
         inline_keyboard=rows
     )
-
-
 def back_keyboard():
 
     return InlineKeyboardMarkup(
@@ -881,7 +877,7 @@ async def show_main_menu(
                 first_name
             ),
             parse_mode="HTML",
-            reply_markup=main_keyboard()
+            reply_markup=main_keyboard(user_id=owner_id)
         )
 
     except TelegramNetworkError as error:
@@ -3711,7 +3707,7 @@ def build_admin_logs_text(limit=20):
 async def open_admin_logs(
     callback: CallbackQuery
 ):
-
+    
     if not ADMIN_ID or callback.from_user.id != ADMIN_ID:
         await callback.answer(
             "⛔ Доступ только для администратора.",
