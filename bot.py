@@ -14,24 +14,24 @@ from aiogram.types import (
     InlineKeyboardButton,
     CallbackQuery,
     FSInputFile,
+    InputProfilePhotoStatic,
 )
 from aiogram.exceptions import TelegramNetworkError
+
 
 
 # =========================================================
 # CONFIG
 # =========================================================
 
-TOKEN = "8675286625:AAExvHt-ZEOrLAjagpcW93lR6DQ3IosYwaI"
+TOKEN = os.getenv("BOT_TOKEN", "")
 
-FFMPEG_PATH = (
-    r"C:\Users\1\AppData\Local\Microsoft\WinGet\Packages"
-    r"\Gyan.FFmpeg_Microsoft.Winget.Source_8wekyb3d8bbwe"
-    r"\ffmpeg-9.0.1-full_build\bin\ffmpeg.exe"
-)
+FFMPEG_PATH = os.getenv("FFMPEG_PATH", "ffmpeg")
 
 SUPPORT_URL = "https://t.me/your_support"
 PREMIUM_URL = "https://t.me/your_premium"
+
+
 
 MAX_SPAM_COUNT = 10
 SPAM_DELAY = 0.35
@@ -180,8 +180,8 @@ db.commit()
 
 active_spam_tasks = {}
 
-converter_users = set()
 
+converter_users = set()
 
 # =========================================================
 # HELPERS
@@ -1264,6 +1264,7 @@ async def save_command(
     print("=" * 60)
     print()
 
+
 # .SPAM
 # =========================================================
 
@@ -1828,9 +1829,22 @@ async def convert_video_handler(
         # FFMPEG
         # -------------------------------------------------
 
+        import shutil
+
+        actual_ffmpeg = (
+            FFMPEG_PATH
+            if os.path.isfile(str(FFMPEG_PATH))
+            else shutil.which(str(FFMPEG_PATH))
+        )
+
+        if not actual_ffmpeg:
+            raise RuntimeError(
+                "FFmpeg не установлен на сервере."
+            )
+
         ffmpeg_command = [
 
-            FFMPEG_PATH,
+            actual_ffmpeg,
 
             "-y",
 
@@ -2107,6 +2121,450 @@ async def convert_video_handler(
                     filename,
                     repr(error)
                 )
+
+
+
+# =========================================================
+# BUSINESS PROFILE COPY / BACK
+# =========================================================
+
+def profile_backup_path(owner_id):
+    return os.path.abspath(
+        f"profile_backup_{owner_id}.jpg"
+    )
+
+
+async def download_profile_photo_by_user_id(
+    user_id,
+    destination
+):
+    photos = await bot.get_user_profile_photos(
+        user_id=user_id,
+        offset=0,
+        limit=1
+    )
+
+    if not photos.photos:
+        return False
+
+    largest = photos.photos[0][-1]
+
+    telegram_file = await bot.get_file(
+        largest.file_id
+    )
+
+    if not telegram_file.file_path:
+        return False
+
+    await bot.download_file(
+        telegram_file.file_path,
+        destination=destination
+    )
+
+    return os.path.exists(destination)
+
+
+async def backup_business_profile(connection):
+    owner_id = connection.user.id
+
+    current = await bot.get_chat(
+        chat_id=owner_id
+    )
+
+    photo_path = profile_backup_path(
+        owner_id
+    )
+
+    try:
+        if os.path.exists(photo_path):
+            os.remove(photo_path)
+    except Exception:
+        pass
+
+    has_photo = 0
+
+    try:
+        has_photo = int(
+            await download_profile_photo_by_user_id(
+                owner_id,
+                photo_path
+            )
+        )
+    except Exception as error:
+        print(
+            "⚠️ BACKUP PHOTO ERROR:",
+            repr(error)
+        )
+
+    cursor.execute("""
+        INSERT INTO profile_backup (
+            owner_id,
+            first_name,
+            last_name,
+            bio,
+            photo_path,
+            has_photo,
+            saved_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+
+        ON CONFLICT(owner_id)
+        DO UPDATE SET
+            first_name = excluded.first_name,
+            last_name = excluded.last_name,
+            bio = excluded.bio,
+            photo_path = excluded.photo_path,
+            has_photo = excluded.has_photo,
+            saved_at = excluded.saved_at
+    """, (
+        owner_id,
+        current.first_name or "",
+        current.last_name or "",
+        getattr(current, "bio", "") or "",
+        photo_path if has_photo else None,
+        has_photo,
+        datetime.now(timezone.utc).isoformat()
+    ))
+
+    db.commit()
+
+
+async def get_target_profile(target_user_id):
+    target = await bot.get_chat(
+        chat_id=target_user_id
+    )
+
+    photo_path = os.path.abspath(
+        f"profile_source_{uuid.uuid4().hex}.jpg"
+    )
+
+    has_photo = False
+
+    try:
+        has_photo = await download_profile_photo_by_user_id(
+            target_user_id,
+            photo_path
+        )
+    except Exception as error:
+        print(
+            "⚠️ TARGET PHOTO ERROR:",
+            repr(error)
+        )
+
+    return target, (
+        photo_path
+        if has_photo
+        else None
+    )
+
+
+async def copy_business_profile(
+    connection,
+    target_user_id
+):
+    connection_id = connection.id
+    rights = connection.rights
+
+    if rights:
+
+        if not getattr(
+            rights,
+            "can_change_name",
+            False
+        ):
+            return False, "Нет права изменять имя."
+
+        if not getattr(
+            rights,
+            "can_change_bio",
+            False
+        ):
+            return False, "Нет права изменять био."
+
+        if not getattr(
+            rights,
+            "can_edit_profile_photo",
+            False
+        ):
+            return False, "Нет права изменять аватар."
+
+    # Сохраняем исходный Business-профиль.
+    await backup_business_profile(
+        connection
+    )
+
+    target, source_photo = (
+        await get_target_profile(
+            target_user_id
+        )
+    )
+
+    try:
+
+        await bot.set_business_account_name(
+            business_connection_id=connection_id,
+            first_name=(
+                target.first_name
+                or "User"
+            ),
+            last_name=(
+                target.last_name
+                or ""
+            )
+        )
+
+        await bot.set_business_account_bio(
+            business_connection_id=connection_id,
+            bio=(
+                getattr(
+                    target,
+                    "bio",
+                    ""
+                )
+                or ""
+            )[:140]
+        )
+
+        if source_photo:
+
+            await bot.set_business_account_profile_photo(
+                business_connection_id=connection_id,
+                photo=InputProfilePhotoStatic(
+                    photo=FSInputFile(
+                        source_photo
+                    )
+                )
+            )
+
+        else:
+
+            try:
+                await bot.remove_business_account_profile_photo(
+                    business_connection_id=connection_id
+                )
+            except Exception as error:
+                print(
+                    "⚠️ REMOVE TARGET PHOTO ERROR:",
+                    repr(error)
+                )
+
+    finally:
+
+        if source_photo:
+
+            try:
+                os.remove(
+                    source_photo
+                )
+            except Exception:
+                pass
+
+    return True, "✅ Профиль скопирован."
+
+
+async def restore_business_profile(
+    connection
+):
+    owner_id = connection.user.id
+    connection_id = connection.id
+
+    cursor.execute("""
+        SELECT
+            first_name,
+            last_name,
+            bio,
+            photo_path,
+            has_photo
+
+        FROM profile_backup
+
+        WHERE owner_id = ?
+    """, (
+        owner_id,
+    ))
+
+    row = cursor.fetchone()
+
+    if not row:
+        return False, "❌ Сохранённого профиля нет."
+
+    (
+        first_name,
+        last_name,
+        bio,
+        photo_path,
+        has_photo
+    ) = row
+
+    rights = connection.rights
+
+    if rights:
+
+        if not getattr(
+            rights,
+            "can_change_name",
+            False
+        ):
+            return False, "Нет права изменять имя."
+
+        if not getattr(
+            rights,
+            "can_change_bio",
+            False
+        ):
+            return False, "Нет права изменять био."
+
+        if not getattr(
+            rights,
+            "can_edit_profile_photo",
+            False
+        ):
+            return False, "Нет права изменять аватар."
+
+    await bot.set_business_account_name(
+        business_connection_id=connection_id,
+        first_name=first_name or "User",
+        last_name=last_name or ""
+    )
+
+    await bot.set_business_account_bio(
+        business_connection_id=connection_id,
+        bio=(bio or "")[:140]
+    )
+
+    if (
+        has_photo
+        and photo_path
+        and os.path.exists(photo_path)
+    ):
+
+        await bot.set_business_account_profile_photo(
+            business_connection_id=connection_id,
+            photo=InputProfilePhotoStatic(
+                photo=FSInputFile(
+                    photo_path
+                )
+            )
+        )
+
+    else:
+
+        try:
+            await bot.remove_business_account_profile_photo(
+                business_connection_id=connection_id
+            )
+        except Exception as error:
+            print(
+                "⚠️ REMOVE OLD PHOTO ERROR:",
+                repr(error)
+            )
+
+    return True, "✅ Исходный профиль восстановлен."
+
+
+# =========================================================
+# .COPY
+# =========================================================
+
+@dp.business_message(F.text == ".copy")
+async def copy_profile_command(
+    message: types.Message
+):
+
+    reply = message.reply_to_message
+
+    if not reply or not reply.from_user:
+
+        print(
+            "❌ .copy должен быть ответом "
+            "на сообщение собеседника."
+        )
+
+        return
+
+    connection = await get_business_connection(
+        message.business_connection_id
+    )
+
+    if not connection:
+
+        print(
+            "❌ Business connection не найден."
+        )
+
+        return
+
+    print()
+    print("=" * 60)
+    print("👤 COPY PROFILE")
+    print("Connection:", connection.id)
+    print("Owner:", connection.user.id)
+    print("Target:", reply.from_user.id)
+    print("=" * 60)
+
+    try:
+
+        ok, info = await copy_business_profile(
+            connection,
+            reply.from_user.id
+        )
+
+        print(
+            info
+        )
+
+    except Exception as error:
+
+        print(
+            "❌ COPY ERROR:",
+            repr(error)
+        )
+
+
+# =========================================================
+# .BACK
+# =========================================================
+
+@dp.business_message(F.text == ".back")
+async def back_profile_command(
+    message: types.Message
+):
+
+    connection = await get_business_connection(
+        message.business_connection_id
+    )
+
+    if not connection:
+
+        print(
+            "❌ Business connection не найден."
+        )
+
+        return
+
+    print()
+    print("=" * 60)
+    print("↩️ BACK PROFILE")
+    print("Connection:", connection.id)
+    print("Owner:", connection.user.id)
+    print("=" * 60)
+
+    try:
+
+        ok, info = await restore_business_profile(
+            connection
+        )
+
+        print(
+            info
+        )
+
+    except Exception as error:
+
+        print(
+            "❌ BACK ERROR:",
+            repr(error)
+        )
 
 
 # =========================================================
@@ -3648,6 +4106,12 @@ async def private_deleted_command(
 
 async def main():
 
+    if not TOKEN:
+        print(
+            "❌ BOT_TOKEN не задан."
+        )
+        return
+
     print()
     print("=" * 60)
     print("🚀 BUSINESS ARCHIVE ЗАПУЩЕН")
@@ -3659,22 +4123,25 @@ async def main():
         FFMPEG_PATH
     )
 
-    if os.path.isfile(
+    import shutil
+
+    actual_ffmpeg = (
         FFMPEG_PATH
-    ):
+        if os.path.isfile(str(FFMPEG_PATH))
+        else shutil.which(str(FFMPEG_PATH))
+    )
 
-        print(
-            "✅ FFmpeg найден"
-        )
+    print(
+        "FFmpeg:",
+        actual_ffmpeg or FFMPEG_PATH
+    )
 
+    if actual_ffmpeg:
+        print("✅ FFmpeg найден")
     else:
-
-        print(
-            "❌ FFmpeg НЕ найден!"
-        )
+        print("❌ FFmpeg НЕ найден!")
 
     print()
-
     await dp.start_polling(bot)
 
 
