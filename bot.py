@@ -991,7 +991,7 @@ async def business_connection_handler(
 # ADMIN_ID=123456789
 #
 # Локально можно временно указать число прямо здесь.
-ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
+ADMIN_ID = int(os.getenv("561985152", "0"))
 
 
 async def send_saved_to_admin(
