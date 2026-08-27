@@ -594,12 +594,6 @@ def main_keyboard(user_id=None):
             )
         ],
 
-        [
-            InlineKeyboardButton(
-                text="🎬 Конвертер",
-                callback_data="open_converter"
-            )
-        ],
     ]
 
     # Логи добавляются только если настроен ADMIN_ID.
@@ -642,14 +636,6 @@ def main_keyboard(user_id=None):
     ])
 
 
-    if ADMIN_ID and user_id == ADMIN_ID:
-        rows.append([
-            InlineKeyboardButton(
-                text="📋 Логи",
-                callback_data="open_admin_logs"
-            )
-        ])
-
 
     return InlineKeyboardMarkup(
         inline_keyboard=rows
@@ -680,28 +666,21 @@ def commands_keyboard():
                 InlineKeyboardButton(
                     text=".spam",
                     callback_data="command_spam"
-                ),
-                InlineKeyboardButton(
-                    text=".bspam",
-                    callback_data="command_bspam"
                 )
             ],
 
             [
-                InlineKeyboardButton(
-                    text=".save",
-                    callback_data="command_save"
-                ),
                 InlineKeyboardButton(
                     text=".copy",
                     callback_data="command_copy"
                 )
             ],
 
+
             [
                 InlineKeyboardButton(
-                    text=".back",
-                    callback_data="command_back"
+                    text="🎬 Конвертер",
+                    callback_data="open_converter"
                 )
             ],
 
@@ -714,8 +693,6 @@ def commands_keyboard():
 
         ]
     )
-
-
 def converter_keyboard():
 
     return InlineKeyboardMarkup(
@@ -736,8 +713,8 @@ def converter_keyboard():
 
             [
                 InlineKeyboardButton(
-                    text="⬅️ Назад",
-                    callback_data="open_menu"
+                    text="⬅️ К командам",
+                    callback_data="open_commands"
                 )
             ]
 
@@ -1437,6 +1414,7 @@ async def spam_command(
             text=(
                 "❌ <b>Формат:</b>\n\n"
                 "<code>.spam N текст</code>\n\n"
+                "Чтобы удалить сообщения отправленные командой, .bspam \n\n"
                 "Пример:\n"
                 "<code>.spam 3 Привет</code>"
             ),
@@ -4352,7 +4330,8 @@ async def command_copy_help(
         "Ответь этой командой на сообщение "
         "собеседника.\n\n"
         "Бот попробует скопировать имя, био "
-        "и фото профиля."
+        "и фото профиля.\n\n"
+        "Для того чтобы вернуть исходный профиль, .back \n\n"
     )
 
     await replace_menu(
