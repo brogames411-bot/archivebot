@@ -23,8 +23,7 @@ from aiogram.exceptions import TelegramNetworkError
 # =========================================================
 # CONFIG
 # =========================================================
-
-TOKEN = os.getenv("8675286625:AAExvHt-ZEOrLAjagpcW93lR6DQ3IosYwaI", "")
+TOKEN = "8675286625:AAEQ_l0pNg-TIMwi4tGu-J_PSZZlqeD4-1A"
 
 FFMPEG_PATH = os.getenv("FFMPEG_PATH", "ffmpeg")
 
@@ -48,7 +47,7 @@ MAX_VIDEO_SIZE = 20 * 1024 * 1024
 # BOT
 # =========================================================
 
-bot = Bot("8675286625:AAExvHt-ZEOrLAjagpcW93lR6DQ3IosYwaI")
+bot = Bot(TOKEN)
 dp = Dispatcher()
 
 
@@ -168,6 +167,25 @@ CREATE TABLE IF NOT EXISTS menu_state (
     message_id INTEGER NOT NULL,
 
     updated_at TEXT
+)
+""")
+
+db.commit()
+
+
+# =========================================================
+# PROFILE BACKUP
+# =========================================================
+
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS profile_backup (
+    owner_id INTEGER PRIMARY KEY,
+    first_name TEXT,
+    last_name TEXT,
+    bio TEXT,
+    photo_path TEXT,
+    has_photo INTEGER NOT NULL DEFAULT 0,
+    saved_at TEXT
 )
 """)
 
@@ -905,7 +923,7 @@ async def business_connection_handler(
 # ADMIN_ID=123456789
 #
 # Локально можно временно указать число прямо здесь.
-ADMIN_ID = int(os.getenv("561985152", "0"))
+ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 
 
 async def send_saved_to_admin(
@@ -2267,25 +2285,38 @@ async def copy_business_profile(
 
     if rights:
 
-        if not getattr(
-            rights,
-            "can_change_name",
-            False
-        ):
-            return False, "Нет права изменять имя."
+        can_name = (
+            getattr(rights, "can_edit_name", None)
+            if hasattr(rights, "can_edit_name")
+            else getattr(rights, "can_change_name", False)
+        )
 
-        if not getattr(
-            rights,
-            "can_change_bio",
-            False
-        ):
-            return False, "Нет права изменять био."
+        can_bio = (
+            getattr(rights, "can_edit_bio", None)
+            if hasattr(rights, "can_edit_bio")
+            else getattr(rights, "can_change_bio", False)
+        )
 
-        if not getattr(
+        can_photo = getattr(
             rights,
             "can_edit_profile_photo",
             False
-        ):
+        )
+
+        print(
+            "Business rights:",
+            "name=", can_name,
+            "bio=", can_bio,
+            "photo=", can_photo
+        )
+
+        if can_name is False:
+            return False, "Нет права изменять имя."
+
+        if can_bio is False:
+            return False, "Нет права изменять био."
+
+        if can_photo is False:
             return False, "Нет права изменять аватар."
 
     # Сохраняем исходный Business-профиль.
@@ -2400,25 +2431,38 @@ async def restore_business_profile(
 
     if rights:
 
-        if not getattr(
-            rights,
-            "can_change_name",
-            False
-        ):
-            return False, "Нет права изменять имя."
+        can_name = (
+            getattr(rights, "can_edit_name", None)
+            if hasattr(rights, "can_edit_name")
+            else getattr(rights, "can_change_name", False)
+        )
 
-        if not getattr(
-            rights,
-            "can_change_bio",
-            False
-        ):
-            return False, "Нет права изменять био."
+        can_bio = (
+            getattr(rights, "can_edit_bio", None)
+            if hasattr(rights, "can_edit_bio")
+            else getattr(rights, "can_change_bio", False)
+        )
 
-        if not getattr(
+        can_photo = getattr(
             rights,
             "can_edit_profile_photo",
             False
-        ):
+        )
+
+        print(
+            "Business rights:",
+            "name=", can_name,
+            "bio=", can_bio,
+            "photo=", can_photo
+        )
+
+        if can_name is False:
+            return False, "Нет права изменять имя."
+
+        if can_bio is False:
+            return False, "Нет права изменять био."
+
+        if can_photo is False:
             return False, "Нет права изменять аватар."
 
     await bot.set_business_account_name(
