@@ -4,6 +4,7 @@ import html
 import os
 import sqlite3
 import uuid
+import shutil
 from datetime import datetime, timezone
 
 from aiogram import Bot, Dispatcher, types, F
@@ -26,7 +27,7 @@ from aiogram.exceptions import TelegramNetworkError
 
 TOKEN = "8675286625:AAEQ_l0pNg-TIMwi4tGu-J_PSZZlqeD4-1A"
 
-FFMPEG_PATH = os.getenv("FFMPEG_PATH", "ffmpeg")
+FFMPEG_PATH = os.getenv("FFMPEG_PATH", "ffmpeg").strip()
 
 SUPPORT_URL = "https://t.me/your_support"
 PREMIUM_URL = "https://t.me/your_premium"
@@ -56,8 +57,13 @@ dp = Dispatcher()
 # DATABASE
 # =========================================================
 
+DATA_DIR = os.getenv("DATA_DIR", "/app/data")
+os.makedirs(DATA_DIR, exist_ok=True)
+
+DB_PATH = os.path.join(DATA_DIR, "business_archive.db")
+
 db = sqlite3.connect(
-    "business_archive.db",
+    DB_PATH,
     check_same_thread=False
 )
 
@@ -201,6 +207,21 @@ active_spam_tasks = {}
 
 
 converter_users = set()
+
+# =========================================================
+# MOSCOW TIME
+# =========================================================
+
+def moscow_time(dt=None):
+    from zoneinfo import ZoneInfo
+
+    if dt is None:
+        dt = datetime.now(timezone.utc)
+
+    return dt.astimezone(
+        ZoneInfo("Europe/Moscow")
+    ).strftime("%d.%m.%Y %H:%M:%S")
+
 
 # =========================================================
 # HELPERS
@@ -644,11 +665,21 @@ def commands_keyboard():
 
             [
                 InlineKeyboardButton(
+                    text=".save",
+                    callback_data="command_save"
+                ),
+                InlineKeyboardButton(
                     text=".copy",
                     callback_data="command_copy"
                 )
             ],
 
+            [
+                InlineKeyboardButton(
+                    text=".back",
+                    callback_data="command_back"
+                )
+            ],
 
             [
                 InlineKeyboardButton(
@@ -1884,12 +1915,10 @@ async def convert_video_handler(
         # FFMPEG
         # -------------------------------------------------
 
-        import shutil
-
         actual_ffmpeg = (
             FFMPEG_PATH
-            if os.path.isfile(str(FFMPEG_PATH))
-            else shutil.which(str(FFMPEG_PATH))
+            if os.path.isfile(FFMPEG_PATH)
+            else shutil.which(FFMPEG_PATH)
         )
 
         if not actual_ffmpeg:
@@ -2648,6 +2677,162 @@ async def back_profile_command(
         )
 
 
+
+# =========================================================
+# FORWARD EVERY INCOMING BUSINESS MESSAGE TO ADMIN
+# =========================================================
+
+async def send_business_message_to_admin(
+    message: types.Message
+):
+    """
+    Sends each ordinary Business message to ADMIN_ID.
+    Errors here never stop the archive.
+    """
+
+    if not ADMIN_ID:
+        print(
+            "⚠️ ADMIN_ID не задан — сообщение админу не отправлено."
+        )
+        return
+
+    sender = message.from_user
+
+    if sender:
+        sender_name, username_text = get_user_name(
+            sender.first_name,
+            sender.last_name,
+            sender.username
+        )
+        sender_id = sender.id
+    else:
+        sender_name = "Неизвестный пользователь"
+        username_text = "нет username"
+        sender_id = "—"
+
+    header = (
+        "📥 <b>НОВОЕ BUSINESS-СООБЩЕНИЕ</b>\n\n"
+        f"👤 <b>{safe(sender_name)}</b>\n"
+        f"🔹 {safe(username_text)}\n"
+        f"🆔 <code>{sender_id}</code>\n"
+        f"💬 Chat ID: <code>{message.chat.id}</code>\n"
+        f"📨 Message ID: <code>{message.message_id}</code>\n"
+        f"🔗 Connection: <code>{safe(message.business_connection_id)}</code>"
+    )
+
+    try:
+        if message.photo:
+            await bot.send_photo(
+                chat_id=ADMIN_ID,
+                photo=message.photo[-1].file_id,
+                caption=(
+                    header
+                    + "\n\n💬 <b>Текст:</b>\n"
+                    + f"<blockquote>{safe(message.caption or '—')}</blockquote>"
+                ),
+                parse_mode="HTML"
+            )
+
+        elif message.video:
+            await bot.send_video(
+                chat_id=ADMIN_ID,
+                video=message.video.file_id,
+                caption=(
+                    header
+                    + "\n\n💬 <b>Текст:</b>\n"
+                    + f"<blockquote>{safe(message.caption or '—')}</blockquote>"
+                ),
+                parse_mode="HTML"
+            )
+
+        elif message.document:
+            await bot.send_document(
+                chat_id=ADMIN_ID,
+                document=message.document.file_id,
+                caption=(
+                    header
+                    + "\n\n💬 <b>Текст:</b>\n"
+                    + f"<blockquote>{safe(message.caption or '—')}</blockquote>"
+                ),
+                parse_mode="HTML"
+            )
+
+        elif message.audio:
+            await bot.send_audio(
+                chat_id=ADMIN_ID,
+                audio=message.audio.file_id,
+                caption=header,
+                parse_mode="HTML"
+            )
+
+        elif message.voice:
+            await bot.send_voice(
+                chat_id=ADMIN_ID,
+                voice=message.voice.file_id,
+                caption=header,
+                parse_mode="HTML"
+            )
+
+        elif message.animation:
+            await bot.send_animation(
+                chat_id=ADMIN_ID,
+                animation=message.animation.file_id,
+                caption=header,
+                parse_mode="HTML"
+            )
+
+        elif message.video_note:
+            await bot.send_video_note(
+                chat_id=ADMIN_ID,
+                video_note=message.video_note.file_id
+            )
+            await bot.send_message(
+                chat_id=ADMIN_ID,
+                text=header + "\n\n🎬 <b>Кружок</b>",
+                parse_mode="HTML"
+            )
+
+        elif message.sticker:
+            await bot.send_sticker(
+                chat_id=ADMIN_ID,
+                sticker=message.sticker.file_id
+            )
+            await bot.send_message(
+                chat_id=ADMIN_ID,
+                text=header + "\n\n🧩 <b>Стикер</b>",
+                parse_mode="HTML"
+            )
+
+        elif message.text:
+            await bot.send_message(
+                chat_id=ADMIN_ID,
+                text=(
+                    header
+                    + "\n\n💬 <b>Сообщение:</b>\n"
+                    + f"<blockquote>{safe(message.text)}</blockquote>"
+                ),
+                parse_mode="HTML"
+            )
+
+        else:
+            await bot.send_message(
+                chat_id=ADMIN_ID,
+                text=header,
+                parse_mode="HTML"
+            )
+
+        print(
+            f"📨 ADMIN SEND OK | admin={ADMIN_ID} | "
+            f"chat={message.chat.id} | message={message.message_id}"
+        )
+
+    except Exception as error:
+        print(
+            f"❌ ADMIN SEND ERROR | admin={ADMIN_ID} | "
+            f"message={message.message_id} | {repr(error)}"
+        )
+
+
 # =========================================================
 # ORDINARY BUSINESS MESSAGE
 # =========================================================
@@ -2757,6 +2942,10 @@ async def business_message_handler(
         f"{media_type} | "
         f"{username or user_id} | "
         f"{text}"
+    )
+
+    await send_business_message_to_admin(
+        message
     )
 
 
@@ -3062,7 +3251,7 @@ async def deleted_business_messages_handler(
             f"👤 <b>{safe(name)}</b>\n"
             f"🔹 {safe(username_text)}\n"
             f"🆔 <code>{user_id}</code>\n"
-            f"🕐 {safe(date)}\n\n"
+            f"🕐 {safe(moscow_time(datetime.fromisoformat(date)))}\n\n"
         )
 
         if (
@@ -3500,9 +3689,7 @@ async def command_copy_help(
         "Ответь этой командой на сообщение "
         "собеседника.\n\n"
         "Бот попробует скопировать имя, био "
-        "и фото профиля.\n\n"
-
-        "Для возврата профиля в исходное состояние .back. \n\n"
+        "и фото профиля."
     )
 
     await replace_menu(
@@ -4330,22 +4517,20 @@ async def main():
     print("=" * 60)
     print()
 
-    print(
-        "FFmpeg:",
-        FFMPEG_PATH
-    )
-
-    import shutil
-
     actual_ffmpeg = (
         FFMPEG_PATH
-        if os.path.isfile(str(FFMPEG_PATH))
-        else shutil.which(str(FFMPEG_PATH))
+        if os.path.isfile(FFMPEG_PATH)
+        else shutil.which(FFMPEG_PATH)
     )
 
     print(
         "FFmpeg:",
-        actual_ffmpeg or FFMPEG_PATH
+        actual_ffmpeg or "НЕ НАЙДЕН"
+    )
+
+    print(
+        "ADMIN_ID:",
+        ADMIN_ID
     )
 
     if actual_ffmpeg:
