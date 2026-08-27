@@ -991,7 +991,7 @@ async def business_connection_handler(
 # ADMIN_ID=123456789
 #
 # Локально можно временно указать число прямо здесь.
-ADMIN_ID = int(os.getenv("561985152", "0"))
+ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 
 
 async def send_saved_to_admin(
@@ -1813,18 +1813,24 @@ async def convert_video_handler(
     # Проверка FFmpeg
     # -----------------------------------------------------
 
-    if not os.path.isfile(
-        FFMPEG_PATH
-    ):
+    import shutil
 
+    actual_ffmpeg = (
+        FFMPEG_PATH
+        if os.path.isfile(FFMPEG_PATH)
+        else shutil.which(FFMPEG_PATH)
+    )
+
+    if not actual_ffmpeg:
         await message.answer(
-            "❌ <b>FFmpeg не найден.</b>\n\n"
-            f"<code>{safe(FFMPEG_PATH)}</code>",
+            "❌ <b>FFmpeg не найден.</b>",
             parse_mode="HTML"
         )
-
+        print("❌ FFmpeg не найден!")
+        print("FFMPEG_PATH:", FFMPEG_PATH)
         return
 
+    print("✅ FFmpeg для конвертера:", actual_ffmpeg)
     # -----------------------------------------------------
     # Длительность
     # -----------------------------------------------------
@@ -1929,9 +1935,9 @@ async def convert_video_handler(
         ffmpeg_command = [
 
             actual_ffmpeg,
-
+        
             "-y",
-
+            "-nostdin",
             "-i",
             input_file,
 
@@ -1970,7 +1976,15 @@ async def convert_video_handler(
 
             output_file
         ]
+        print("✅ GET FILE OK")
 
+        await bot.download_file(
+            telegram_file.file_path,
+            destination=input_file
+        )
+
+        print("✅ VIDEO DOWNLOAD OK")
+        print("📦 Input size:", os.path.getsize(input_file))
         print()
         print("=" * 60)
         print("🎬 FFMPEG")
@@ -1992,20 +2006,33 @@ async def convert_video_handler(
         # -------------------------------------------------
         # PROCESS
         # -------------------------------------------------
+        process = await asyncio.create_subprocess_exec(
+            *ffmpeg_command,
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
 
-        process = (
-            await asyncio.create_subprocess_exec(
-                *ffmpeg_command,
-
-                stdout=asyncio.subprocess.PIPE,
-
-                stderr=asyncio.subprocess.PIPE
+        try:
+            stdout, stderr = await asyncio.wait_for(
+                process.communicate(),
+                timeout=120
             )
-        )
 
-        stdout, stderr = (
-            await process.communicate()
-        )
+        except asyncio.TimeoutError:
+
+            print("❌ FFmpeg завис — принудительно завершаю процесс.")
+
+            process.kill()
+
+            try:
+                await process.wait()
+            except Exception:
+                pass
+
+            raise RuntimeError(
+                "FFmpeg слишком долго обрабатывал видео."
+            )
 
         if process.returncode != 0:
 
