@@ -209,6 +209,7 @@ active_spam_tasks = {}
 
 
 converter_users = set()
+audio_converter_users = set()
 
 # =========================================================
 # MOSCOW TIME
@@ -726,6 +727,12 @@ def converter_keyboard():
                     callback_data="video_to_circle"
                 )
             ],
+            [
+                InlineKeyboardButton(
+                    text="🎵 Извлечь звук",
+                    callback_data="video_to_audio"
+                )
+            ],
 
             [
                 InlineKeyboardButton(
@@ -734,6 +741,21 @@ def converter_keyboard():
                 )
             ]
 
+        ]
+    )
+
+
+
+def audio_converter_wait_keyboard():
+
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="❌ Отмена",
+                    callback_data="cancel_audio_converter"
+                )
+            ]
         ]
     )
 
@@ -1803,6 +1825,271 @@ async def cancel_converter(
         )
     except Exception:
         pass
+
+
+# =========================================================
+# VIDEO -> AUDIO
+# =========================================================
+
+@dp.callback_query(
+    lambda c: c.data == "video_to_audio"
+)
+async def video_to_audio(
+    callback: CallbackQuery
+):
+
+    audio_converter_users.add(
+        callback.from_user.id
+    )
+
+    await replace_menu(
+        callback,
+        (
+            "🎵 <b>Извлечь звук из видео</b>\n\n"
+            "Пришлите видео — бот извлечёт "
+            "аудиодорожку и отправит её как MP3.\n\n"
+            "⏱ Максимальная длительность: "
+            "<b>60 секунд</b>."
+        ),
+        audio_converter_wait_keyboard()
+    )
+
+
+@dp.callback_query(
+    lambda c: c.data == "cancel_audio_converter"
+)
+async def cancel_audio_converter(
+    callback: CallbackQuery
+):
+
+    audio_converter_users.discard(
+        callback.from_user.id
+    )
+
+    await show_main_menu(
+        owner_id=callback.from_user.id,
+        chat_id=callback.message.chat.id,
+        first_name=(
+            callback.from_user.first_name
+            or "друг"
+        )
+    )
+
+    try:
+        await callback.answer(
+            "Извлечение аудио отменено"
+        )
+    except Exception:
+        pass
+
+
+@dp.message(F.video)
+async def extract_audio_handler(
+    message: types.Message
+):
+
+    user_id = (
+        message.from_user.id
+        if message.from_user
+        else 0
+    )
+
+    if user_id not in audio_converter_users:
+        return
+
+    audio_converter_users.discard(
+        user_id
+    )
+
+    duration = (
+        message.video.duration
+        or 0
+    )
+
+    actual_ffmpeg = (
+        FFMPEG_PATH
+        if os.path.isfile(FFMPEG_PATH)
+        else shutil.which(FFMPEG_PATH)
+    )
+
+    if not actual_ffmpeg:
+        await message.answer(
+            "❌ <b>FFmpeg не найден.</b>",
+            parse_mode="HTML"
+        )
+        return
+
+    if duration > MAX_VIDEO_DURATION:
+        await message.answer(
+            "❌ Видео длиннее 60 секунд.",
+            parse_mode="HTML"
+        )
+        return
+
+    if (
+        message.video.file_size
+        and message.video.file_size > MAX_VIDEO_SIZE
+    ):
+        await message.answer(
+            "❌ Видео слишком большое.\n"
+            "Попробуй файл меньше 20 МБ."
+        )
+        return
+
+    unique_id = uuid.uuid4().hex
+
+    input_file = (
+        f"audio_input_{unique_id}.mp4"
+    )
+
+    output_file = (
+        f"audio_output_{unique_id}.mp3"
+    )
+
+    status = None
+
+    try:
+
+        status = await message.answer(
+            "⏳ <b>Извлекаю звук...</b>\n\n"
+            "📥 Получаю видео\n"
+            "🎵 Извлекаю аудио\n"
+            "📤 Готовлю MP3",
+            parse_mode="HTML"
+        )
+
+        telegram_file = await bot.get_file(
+            message.video.file_id
+        )
+
+        if not telegram_file.file_path:
+            raise RuntimeError(
+                "Telegram не вернул путь к видео."
+            )
+
+        await bot.download_file(
+            telegram_file.file_path,
+            destination=input_file
+        )
+
+        ffmpeg_command = [
+            actual_ffmpeg,
+            "-y",
+            "-nostdin",
+            "-i",
+            input_file,
+            "-vn",
+            "-c:a",
+            "libmp3lame",
+            "-b:a",
+            "192k",
+            "-ar",
+            "44100",
+            output_file
+        ]
+
+        process = await asyncio.create_subprocess_exec(
+            *ffmpeg_command,
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+
+        try:
+            stdout, stderr = await asyncio.wait_for(
+                process.communicate(),
+                timeout=120
+            )
+        except asyncio.TimeoutError:
+            process.kill()
+            try:
+                await process.wait()
+            except Exception:
+                pass
+            raise RuntimeError(
+                "FFmpeg слишком долго обрабатывал видео."
+            )
+
+        if process.returncode != 0:
+            error_text = stderr.decode(
+                errors="ignore"
+            )
+            print(
+                "❌ AUDIO FFMPEG ERROR:",
+                error_text
+            )
+            raise RuntimeError(
+                "FFmpeg не смог извлечь аудио."
+            )
+
+        if not os.path.isfile(output_file):
+            raise RuntimeError(
+                "Готовый MP3-файл не найден."
+            )
+
+        try:
+            await status.delete()
+        except Exception:
+            pass
+
+        await bot.send_audio(
+            chat_id=message.chat.id,
+            audio=FSInputFile(output_file),
+            title="Извлечённое аудио",
+            performer="SaveBot",
+            duration=int(duration)
+        )
+
+        try:
+            await message.delete()
+        except Exception as error:
+            print(
+                "⚠️ Не удалось удалить исходное видео:",
+                repr(error)
+            )
+
+        await show_main_menu(
+            owner_id=user_id,
+            chat_id=message.chat.id,
+            first_name=(
+                message.from_user.first_name
+                or "друг"
+            )
+        )
+
+    except Exception as error:
+
+        print(
+            "❌ AUDIO CONVERTER ERROR:",
+            repr(error)
+        )
+
+        try:
+            if status:
+                await status.delete()
+        except Exception:
+            pass
+
+        try:
+            await message.answer(
+                "❌ <b>Ошибка извлечения аудио.</b>\n\n"
+                f"<code>{safe(error)}</code>",
+                parse_mode="HTML"
+            )
+        except Exception:
+            pass
+
+    finally:
+
+        for filename in [
+            input_file,
+            output_file
+        ]:
+            try:
+                if os.path.exists(filename):
+                    os.remove(filename)
+            except Exception:
+                pass
 
 
 # =========================================================
