@@ -26,7 +26,6 @@ from aiogram.exceptions import TelegramNetworkError
 # =========================================================
 
 TOKEN = "8675286625:AAEQ_l0pNg-TIMwi4tGu-J_PSZZlqeD4-1A"
-
 FFMPEG_PATH = os.getenv("FFMPEG_PATH", "ffmpeg").strip()
 
 SUPPORT_URL = "https://t.me/your_support"
@@ -552,83 +551,94 @@ def clear_menu_state(owner_id):
 
 def main_keyboard():
 
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
+    rows = [
+        [
+            InlineKeyboardButton(
+                text="🚀 Подключить Business",
+                callback_data="connect_business"
+            )
+        ],
 
-            [
-                InlineKeyboardButton(
-                    text="🚀 Подключить Business",
-                    callback_data="connect_business"
-                )
-            ],
+        [
+            InlineKeyboardButton(
+                text="🟦 Мой Business",
+                callback_data="my_business"
+            )
+        ],
 
-            [
-                InlineKeyboardButton(
-                    text="🟦 Мой Business",
-                    callback_data="my_business"
-                )
-            ],
+        [
+            InlineKeyboardButton(
+                text="🗑 Удалённые",
+                callback_data="open_deleted"
+            ),
 
-            [
-                InlineKeyboardButton(
-                    text="🗑 Удалённые",
-                    callback_data="open_deleted"
-                ),
+            InlineKeyboardButton(
+                text="ℹ️ Изменённые",
+                callback_data="open_edited"
+            )
+        ],
 
-                InlineKeyboardButton(
-                    text="ℹ️ Изменённые",
-                    callback_data="open_edited"
-                )
-            ],
+        [
+            InlineKeyboardButton(
+                text="💬 Команды",
+                callback_data="open_commands"
+            ),
 
-            [
-                InlineKeyboardButton(
-                    text="💬 Команды",
-                    callback_data="open_commands"
-                ),
+            InlineKeyboardButton(
+                text="📊 Статистика",
+                callback_data="open_stats"
+            )
+        ],
 
-                InlineKeyboardButton(
-                    text="📊 Статистика",
-                    callback_data="open_stats"
-                )
-            ],
+        [
+            InlineKeyboardButton(
+                text="🎬 Конвертер",
+                callback_data="open_converter"
+            )
+        ],
+    ]
 
-            [
-                InlineKeyboardButton(
-                    text="🎬 Конвертер",
-                    callback_data="open_converter"
-                )
-            ],
+    # Логи добавляются только если настроен ADMIN_ID.
+    if ADMIN_ID:
+        rows.append([
+            InlineKeyboardButton(
+                text="📋 Логи",
+                callback_data="open_admin_logs"
+            )
+        ])
 
-            [
-                InlineKeyboardButton(
-                    text="👥 Пригласить друга",
-                    callback_data="invite_friend"
-                )
-            ],
+    rows.extend([
+        [
+            InlineKeyboardButton(
+                text="👥 Пригласить друга",
+                callback_data="invite_friend"
+            )
+        ],
 
-            [
-                InlineKeyboardButton(
-                    text="⚙️ Настройки",
-                    callback_data="open_settings"
-                )
-            ],
+        [
+            InlineKeyboardButton(
+                text="⚙️ Настройки",
+                callback_data="open_settings"
+            )
+        ],
 
-            [
-                InlineKeyboardButton(
-                    text="💎 Business Premium ↗",
-                    url=PREMIUM_URL
-                )
-            ],
+        [
+            InlineKeyboardButton(
+                text="💎 Business Premium ↗",
+                url=PREMIUM_URL
+            )
+        ],
 
-            [
-                InlineKeyboardButton(
-                    text="💡 Поддержка ↗",
-                    url=SUPPORT_URL
-                )
-            ]
-
+        [
+            InlineKeyboardButton(
+                text="💡 Поддержка ↗",
+                url=SUPPORT_URL
+            )
         ]
+    ])
+
+    return InlineKeyboardMarkup(
+        inline_keyboard=rows
     )
 
 
@@ -645,6 +655,26 @@ def back_keyboard():
         ]
     )
 
+
+
+def admin_logs_keyboard():
+
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="🔄 Обновить",
+                    callback_data="open_admin_logs"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="⬅️ Назад",
+                    callback_data="open_menu"
+                )
+            ]
+        ]
+    )
 
 
 def commands_keyboard():
@@ -1813,24 +1843,18 @@ async def convert_video_handler(
     # Проверка FFmpeg
     # -----------------------------------------------------
 
-    import shutil
-
-    actual_ffmpeg = (
+    if not os.path.isfile(
         FFMPEG_PATH
-        if os.path.isfile(FFMPEG_PATH)
-        else shutil.which(FFMPEG_PATH)
-    )
+    ):
 
-    if not actual_ffmpeg:
         await message.answer(
-            "❌ <b>FFmpeg не найден.</b>",
+            "❌ <b>FFmpeg не найден.</b>\n\n"
+            f"<code>{safe(FFMPEG_PATH)}</code>",
             parse_mode="HTML"
         )
-        print("❌ FFmpeg не найден!")
-        print("FFMPEG_PATH:", FFMPEG_PATH)
+
         return
 
-    print("✅ FFmpeg для конвертера:", actual_ffmpeg)
     # -----------------------------------------------------
     # Длительность
     # -----------------------------------------------------
@@ -1935,9 +1959,9 @@ async def convert_video_handler(
         ffmpeg_command = [
 
             actual_ffmpeg,
-        
+
             "-y",
-            "-nostdin",
+
             "-i",
             input_file,
 
@@ -1976,15 +2000,7 @@ async def convert_video_handler(
 
             output_file
         ]
-        print("✅ GET FILE OK")
 
-        await bot.download_file(
-            telegram_file.file_path,
-            destination=input_file
-        )
-
-        print("✅ VIDEO DOWNLOAD OK")
-        print("📦 Input size:", os.path.getsize(input_file))
         print()
         print("=" * 60)
         print("🎬 FFMPEG")
@@ -2006,33 +2022,20 @@ async def convert_video_handler(
         # -------------------------------------------------
         # PROCESS
         # -------------------------------------------------
-        process = await asyncio.create_subprocess_exec(
-            *ffmpeg_command,
-            stdin=asyncio.subprocess.DEVNULL,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
+
+        process = (
+            await asyncio.create_subprocess_exec(
+                *ffmpeg_command,
+
+                stdout=asyncio.subprocess.PIPE,
+
+                stderr=asyncio.subprocess.PIPE
+            )
         )
 
-        try:
-            stdout, stderr = await asyncio.wait_for(
-                process.communicate(),
-                timeout=120
-            )
-
-        except asyncio.TimeoutError:
-
-            print("❌ FFmpeg завис — принудительно завершаю процесс.")
-
-            process.kill()
-
-            try:
-                await process.wait()
-            except Exception:
-                pass
-
-            raise RuntimeError(
-                "FFmpeg слишком долго обрабатывал видео."
-            )
+        stdout, stderr = (
+            await process.communicate()
+        )
 
         if process.returncode != 0:
 
@@ -3591,6 +3594,138 @@ async def my_business(
         )
     )
 
+
+# =========================================================
+# ADMIN LOGS
+# =========================================================
+
+def build_admin_logs_text(limit=20):
+
+    cursor.execute("""
+        SELECT
+            message_id,
+            chat_id,
+            user_id,
+            username,
+            first_name,
+            last_name,
+            text,
+            date,
+            media_type,
+            connection_id
+        FROM messages
+        ORDER BY id DESC
+        LIMIT ?
+    """, (limit,))
+
+    rows = cursor.fetchall()
+
+    if not rows:
+        return (
+            "📋 <b>Логи</b>\n\n"
+            "Пока нет сохранённых Business-сообщений."
+        )
+
+    result = [
+        "📋 <b>Логи Business-сообщений</b>",
+        "",
+        f"Последние {len(rows)} сообщений:",
+        ""
+    ]
+
+    for index, row in enumerate(rows, 1):
+        (
+            message_id,
+            chat_id,
+            user_id,
+            username,
+            first_name,
+            last_name,
+            msg_text,
+            date,
+            media_type,
+            connection_id
+        ) = row
+
+        display_name = " ".join(
+            part for part in [first_name, last_name]
+            if part
+        ).strip() or "Неизвестный пользователь"
+
+        username_text = (
+            f"@{username}"
+            if username
+            else "нет username"
+        )
+
+        # SQLite хранит UTC ISO-время.
+        try:
+            dt = datetime.fromisoformat(date)
+            time_text = moscow_time(dt)
+        except Exception:
+            time_text = str(date)
+
+        media_icons = {
+            "text": "💬",
+            "photo": "🖼",
+            "video": "🎬",
+            "document": "📄",
+            "audio": "🎵",
+            "voice": "🎤",
+            "animation": "🎞",
+            "video_note": "⭕",
+            "sticker": "🧩"
+        }
+
+        media_icon = media_icons.get(
+            media_type,
+            "📦"
+        )
+
+        clean_text = (msg_text or "").replace("\n", " ").strip()
+
+        if len(clean_text) > 120:
+            clean_text = clean_text[:120] + "…"
+
+        if not clean_text:
+            clean_text = f"{media_icon} {media_type or 'media'}"
+
+        result.append(
+            f"<b>#{index}</b> "
+            f"👤 <b>{safe(display_name)}</b> "
+            f"{safe(username_text)}\n"
+            f"🆔 <code>{user_id or '—'}</code> | "
+            f"💬 <code>{chat_id}</code>\n"
+            f"📨 <code>{message_id}</code> | "
+            f"🕐 {safe(time_text)}\n"
+            f"{media_icon} {safe(clean_text)}\n"
+            f"🔗 <code>{safe(connection_id or '—')}</code>\n"
+        )
+
+    return "\n".join(result)
+
+
+@dp.callback_query(
+    lambda c: c.data == "open_admin_logs"
+)
+async def open_admin_logs(
+    callback: CallbackQuery
+):
+
+    if not ADMIN_ID or callback.from_user.id != ADMIN_ID:
+        await callback.answer(
+            "⛔ Доступ только для администратора.",
+            show_alert=True
+        )
+        return
+
+    text = build_admin_logs_text(20)
+
+    await replace_menu(
+        callback,
+        text,
+        admin_logs_keyboard()
+    )
 
 # =========================================================
 # COMMANDS PAGE
