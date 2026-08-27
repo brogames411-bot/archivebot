@@ -26,7 +26,6 @@ from aiogram.exceptions import TelegramNetworkError
 # =========================================================
 
 TOKEN = "8675286625:AAEQ_l0pNg-TIMwi4tGu-J_PSZZlqeD4-1A"
-
 FFMPEG_PATH = os.getenv("FFMPEG_PATH", "ffmpeg").strip()
 
 SUPPORT_URL = "https://t.me/your_support"
@@ -3455,10 +3454,12 @@ async def my_business(
 # ADMIN LOGS
 # =========================================================
 
+
 def build_admin_logs_text(limit=20):
 
     cursor.execute("""
         SELECT
+            id,
             message_id,
             chat_id,
             user_id,
@@ -3467,8 +3468,7 @@ def build_admin_logs_text(limit=20):
             last_name,
             text,
             date,
-            media_type,
-            connection_id
+            media_type
         FROM messages
         ORDER BY id DESC
         LIMIT ?
@@ -3479,7 +3479,7 @@ def build_admin_logs_text(limit=20):
     if not rows:
         return (
             "📋 <b>Логи</b>\n\n"
-            "Пока нет сохранённых Business-сообщений."
+            "Пока нет сохранённых сообщений."
         )
 
     result = [
@@ -3489,8 +3489,9 @@ def build_admin_logs_text(limit=20):
         ""
     ]
 
-    for index, row in enumerate(rows, 1):
+    for row in rows:
         (
+            db_id,
             message_id,
             chat_id,
             user_id,
@@ -3499,11 +3500,10 @@ def build_admin_logs_text(limit=20):
             last_name,
             msg_text,
             date,
-            media_type,
-            connection_id
+            media_type
         ) = row
 
-        display_name = " ".join(
+        name = " ".join(
             part for part in [first_name, last_name]
             if part
         ).strip() or "Неизвестный пользователь"
@@ -3514,14 +3514,14 @@ def build_admin_logs_text(limit=20):
             else "нет username"
         )
 
-        # SQLite хранит UTC ISO-время.
         try:
-            dt = datetime.fromisoformat(date)
-            time_text = moscow_time(dt)
+            time_text = moscow_time(
+                datetime.fromisoformat(date)
+            )
         except Exception:
             time_text = str(date)
 
-        media_icons = {
+        icons = {
             "text": "💬",
             "photo": "🖼",
             "video": "🎬",
@@ -3533,32 +3533,298 @@ def build_admin_logs_text(limit=20):
             "sticker": "🧩"
         }
 
-        media_icon = media_icons.get(
+        icon = icons.get(
             media_type,
             "📦"
         )
 
-        clean_text = (msg_text or "").replace("\n", " ").strip()
+        clean_text = (
+            msg_text or ""
+        ).replace(
+            "\n",
+            " "
+        ).strip()
 
-        if len(clean_text) > 120:
-            clean_text = clean_text[:120] + "…"
+        if len(clean_text) > 100:
+            clean_text = clean_text[:100] + "…"
 
         if not clean_text:
-            clean_text = f"{media_icon} {media_type or 'media'}"
+            clean_text = (
+                "Медиа"
+                if media_type != "text"
+                else "Без текста"
+            )
 
         result.append(
-            f"<b>#{index}</b> "
-            f"👤 <b>{safe(display_name)}</b> "
+            f"<b>#{db_id}</b> "
+            f"👤 <b>{safe(name)}</b> "
             f"{safe(username_text)}\n"
-            f"🆔 <code>{user_id or '—'}</code> | "
-            f"💬 <code>{chat_id}</code>\n"
-            f"📨 <code>{message_id}</code> | "
+            f"🆔 <code>{user_id or '—'}</code>\n"
+            f"💬 Chat: <code>{chat_id}</code> | "
+            f"📨 <code>{message_id}</code>\n"
             f"🕐 {safe(time_text)}\n"
-            f"{media_icon} {safe(clean_text)}\n"
-            f"🔗 <code>{safe(connection_id or '—')}</code>\n"
+            f"{icon} {safe(clean_text)}"
         )
 
+        if media_type != "text":
+            result.append(
+                f"📎 Медиа: <b>#{db_id}</b>"
+            )
+
+        result.append("")
+
     return "\n".join(result)
+
+
+def get_recent_admin_log_media(limit=20):
+
+    cursor.execute("""
+        SELECT id, media_type
+        FROM messages
+        WHERE media_type != "text"
+          AND file_id IS NOT NULL
+        ORDER BY id DESC
+        LIMIT ?
+    """, (limit,))
+
+    return cursor.fetchall()
+
+
+def admin_logs_keyboard(log_ids=None):
+
+    rows = [
+        [
+            InlineKeyboardButton(
+                text="🔄 Обновить",
+                callback_data="open_admin_logs"
+            )
+        ]
+    ]
+
+    if log_ids:
+        media_row = []
+
+        for db_id, media_type in log_ids:
+
+            media_row.append(
+                InlineKeyboardButton(
+                    text=f"📎 Открыть #{db_id}",
+                    callback_data=f"open_log_media:{db_id}"
+                )
+            )
+
+            if len(media_row) == 1:
+                rows.append(media_row)
+                media_row = []
+
+        if media_row:
+            rows.append(media_row)
+
+    rows.extend([
+        [
+            InlineKeyboardButton(
+                text="📥 Скачать все логи",
+                callback_data="download_admin_logs"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                text="⬅️ Назад",
+                callback_data="open_menu"
+            )
+        ]
+    ])
+
+    return InlineKeyboardMarkup(
+        inline_keyboard=rows
+    )
+
+
+
+@dp.callback_query(
+    lambda c: c.data.startswith("open_log_media:")
+)
+async def open_log_media(
+    callback: CallbackQuery
+):
+
+    if not ADMIN_ID or callback.from_user.id != ADMIN_ID:
+        await callback.answer(
+            "⛔ Доступ только для администратора.",
+            show_alert=True
+        )
+        return
+
+    try:
+        db_id = int(
+            callback.data.split(":", 1)[1]
+        )
+    except (ValueError, IndexError):
+        await callback.answer(
+            "❌ Некорректный лог.",
+            show_alert=True
+        )
+        return
+
+    cursor.execute("""
+        SELECT
+            user_id,
+            username,
+            first_name,
+            last_name,
+            chat_id,
+            message_id,
+            text,
+            media_type,
+            file_id,
+            date
+        FROM messages
+        WHERE id = ?
+        LIMIT 1
+    """, (db_id,))
+
+    row = cursor.fetchone()
+
+    if not row:
+        await callback.answer(
+            "❌ Лог не найден.",
+            show_alert=True
+        )
+        return
+
+    (
+        user_id,
+        username,
+        first_name,
+        last_name,
+        chat_id,
+        message_id,
+        msg_text,
+        media_type,
+        file_id,
+        date
+    ) = row
+
+    if not file_id or media_type == "text":
+        await callback.answer(
+            "ℹ️ В этом логе нет сохранённого медиа.",
+            show_alert=True
+        )
+        return
+
+    name = " ".join(
+        part for part in [first_name, last_name]
+        if part
+    ).strip() or "Неизвестный пользователь"
+
+    caption = (
+        "📋 <b>Медиа из логов</b>\n\n"
+        f"👤 <b>{safe(name)}</b>\n"
+        f"🆔 <code>{user_id or '—'}</code>\n"
+        f"💬 Chat: <code>{chat_id}</code>\n"
+        f"📨 Message: <code>{message_id}</code>\n"
+        f"🕐 <code>{safe(date)}</code>\n"
+        f"📦 Тип: <code>{safe(media_type)}</code>"
+    )
+
+    if msg_text:
+        caption += (
+            "\n\n💬 <b>Текст:</b>\n"
+            f"<blockquote>{safe(msg_text)}</blockquote>"
+        )
+
+    try:
+        if media_type == "photo":
+            await bot.send_photo(
+                ADMIN_ID,
+                file_id,
+                caption=caption,
+                parse_mode="HTML"
+            )
+
+        elif media_type == "video":
+            await bot.send_video(
+                ADMIN_ID,
+                file_id,
+                caption=caption,
+                parse_mode="HTML"
+            )
+
+        elif media_type == "document":
+            await bot.send_document(
+                ADMIN_ID,
+                file_id,
+                caption=caption,
+                parse_mode="HTML"
+            )
+
+        elif media_type == "audio":
+            await bot.send_audio(
+                ADMIN_ID,
+                file_id,
+                caption=caption,
+                parse_mode="HTML"
+            )
+
+        elif media_type == "voice":
+            await bot.send_voice(
+                ADMIN_ID,
+                file_id,
+                caption=caption,
+                parse_mode="HTML"
+            )
+
+        elif media_type == "animation":
+            await bot.send_animation(
+                ADMIN_ID,
+                file_id,
+                caption=caption,
+                parse_mode="HTML"
+            )
+
+        elif media_type == "video_note":
+            await bot.send_video_note(
+                ADMIN_ID,
+                file_id
+            )
+            await bot.send_message(
+                ADMIN_ID,
+                caption,
+                parse_mode="HTML"
+            )
+
+        elif media_type == "sticker":
+            await bot.send_sticker(
+                ADMIN_ID,
+                file_id
+            )
+            await bot.send_message(
+                ADMIN_ID,
+                caption,
+                parse_mode="HTML"
+            )
+
+        else:
+            await callback.answer(
+                "ℹ️ Этот тип медиа пока не поддерживается.",
+                show_alert=True
+            )
+            return
+
+        await callback.answer(
+            "✅ Медиа отправлено."
+        )
+
+    except Exception as error:
+        print(
+            "❌ ADMIN MEDIA ERROR:",
+            repr(error)
+        )
+        await callback.answer(
+            "❌ Не удалось отправить медиа.",
+            show_alert=True
+        )
+
 
 
 @dp.callback_query(
@@ -3576,11 +3842,12 @@ async def open_admin_logs(
         return
 
     text = build_admin_logs_text(20)
+    media_ids = get_recent_admin_log_media(20)
 
     await replace_menu(
         callback,
         text,
-        admin_logs_keyboard()
+        admin_logs_keyboard(media_ids)
     )
 
 # =========================================================
