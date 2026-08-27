@@ -23,6 +23,7 @@ from aiogram.exceptions import TelegramNetworkError
 # =========================================================
 # CONFIG
 # =========================================================
+
 TOKEN = "8675286625:AAEQ_l0pNg-TIMwi4tGu-J_PSZZlqeD4-1A"
 
 FFMPEG_PATH = os.getenv("FFMPEG_PATH", "ffmpeg")
@@ -620,6 +621,42 @@ def back_keyboard():
                     callback_data="open_menu"
                 )
             ]
+        ]
+    )
+
+
+
+def commands_keyboard():
+
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+
+            [
+                InlineKeyboardButton(
+                    text=".spam",
+                    callback_data="command_spam"
+                ),
+                InlineKeyboardButton(
+                    text=".bspam",
+                    callback_data="command_bspam"
+                )
+            ],
+
+            [
+                InlineKeyboardButton(
+                    text=".copy",
+                    callback_data="command_copy"
+                )
+            ],
+
+
+            [
+                InlineKeyboardButton(
+                    text="⬅️ Назад",
+                    callback_data="open_menu"
+                )
+            ]
+
         ]
     )
 
@@ -3343,6 +3380,7 @@ async def my_business(
 # COMMANDS PAGE
 # =========================================================
 
+
 @dp.callback_query(
     lambda c: c.data == "open_commands"
 )
@@ -3350,37 +3388,167 @@ async def open_commands(
     callback: CallbackQuery
 ):
 
+    await replace_menu(
+        callback,
+        "💬 <b>Команды</b>\n\nВыберите команду:",
+        commands_keyboard()
+    )
+
+
+@dp.callback_query(
+    lambda c: c.data == "command_spam"
+)
+async def command_spam_help(
+    callback: CallbackQuery
+):
+
     text = (
-        "💬 <b>Команды</b>\n\n"
-
-        "<code>.save</code>\n"
-        "Сохранить доступное медиа из ответа.\n\n"
-
-        "<code>.spam N текст</code>\n"
-        "Отправить N сообщений.\n\n"
-
-        "<code>.bspam</code>\n"
-        "Удалить сообщения от .spam.\n\n"
-
-        "<code>/menu</code>\n"
-        "Главное меню.\n\n"
-
-        "<code>/settings</code>\n"
-        "Настройки.\n\n"
-
-        "<code>/stats</code>\n"
-        "Статистика.\n\n"
-
-        "<code>/deleted</code>\n"
-        "Удалённые сообщения."
+        "💬 <b>.spam</b>\n\n"
+        "<code>.spam N текст</code>\n\n"
+        "Отправляет N копий текста.\n\n"
+        "Пример:\n"
+        "<code>.spam 5 Привет</code>\n\n"
+        "Бот отправит 5 сообщений."
     )
 
     await replace_menu(
         callback,
         text,
-        back_keyboard()
+        InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text="⬅️ К командам",
+                        callback_data="open_commands"
+                    )
+                ]
+            ]
+        )
     )
 
+
+@dp.callback_query(
+    lambda c: c.data == "command_bspam"
+)
+async def command_bspam_help(
+    callback: CallbackQuery
+):
+
+    text = (
+        "🗑 <b>.bspam</b>\n\n"
+        "<code>.bspam</code>\n\n"
+        "Удаляет сообщения, отправленные через "
+        "<code>.spam</code>."
+    )
+
+    await replace_menu(
+        callback,
+        text,
+        InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text="⬅️ К командам",
+                        callback_data="open_commands"
+                    )
+                ]
+            ]
+        )
+    )
+
+
+@dp.callback_query(
+    lambda c: c.data == "command_save"
+)
+async def command_save_help(
+    callback: CallbackQuery
+):
+
+    text = (
+        "💾 <b>.save</b>\n\n"
+        "<code>.save</code>\n\n"
+        "Ответь этой командой на сообщение, "
+        "которое нужно сохранить."
+    )
+
+    await replace_menu(
+        callback,
+        text,
+        InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text="⬅️ К командам",
+                        callback_data="open_commands"
+                    )
+                ]
+            ]
+        )
+    )
+
+
+@dp.callback_query(
+    lambda c: c.data == "command_copy"
+)
+async def command_copy_help(
+    callback: CallbackQuery
+):
+
+    text = (
+        "👤 <b>.copy</b>\n\n"
+        "<code>.copy</code>\n\n"
+        "Ответь этой командой на сообщение "
+        "собеседника.\n\n"
+        "Бот попробует скопировать имя, био "
+        "и фото профиля.\n\n"
+
+        "Для возврата профиля в исходное состояние .back. \n\n"
+    )
+
+    await replace_menu(
+        callback,
+        text,
+        InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text="⬅️ К командам",
+                        callback_data="open_commands"
+                    )
+                ]
+            ]
+        )
+    )
+
+
+@dp.callback_query(
+    lambda c: c.data == "command_back"
+)
+async def command_back_help(
+    callback: CallbackQuery
+):
+
+    text = (
+        "↩️ <b>.back</b>\n\n"
+        "<code>.back</code>\n\n"
+        "Возвращает профиль к состоянию, "
+        "которое было сохранено перед последним .copy."
+    )
+
+    await replace_menu(
+        callback,
+        text,
+        InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text="⬅️ К командам",
+                        callback_data="open_commands"
+                    )
+                ]
+            ]
+        )
+    )
 
 # =========================================================
 # EDITED PAGE
