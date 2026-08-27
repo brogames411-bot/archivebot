@@ -24,7 +24,7 @@ from aiogram.exceptions import TelegramNetworkError
 # CONFIG
 # =========================================================
 
-TOKEN = os.getenv("BOT_TOKEN", "")
+TOKEN = os.getenv("8675286625:AAExvHt-ZEOrLAjagpcW93lR6DQ3IosYwaI", "")
 
 FFMPEG_PATH = os.getenv("FFMPEG_PATH", "ffmpeg")
 
