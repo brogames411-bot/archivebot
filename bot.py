@@ -594,7 +594,7 @@ def main_keyboard(user_id=None):
             )
         ],
 
-    ]
+    ],
 
     # Логи добавляются только если настроен ADMIN_ID.
     if ADMIN_ID:
@@ -606,12 +606,6 @@ def main_keyboard(user_id=None):
         ])
 
     rows.extend([
-        [
-            InlineKeyboardButton(
-                text="👥 Пригласить друга",
-                callback_data="invite_friend"
-            )
-        ],
 
         [
             InlineKeyboardButton(
