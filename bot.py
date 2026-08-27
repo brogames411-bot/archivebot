@@ -3,6 +3,7 @@ import difflib
 import html
 import os
 import sqlite3
+from io import StringIO
 import uuid
 import shutil
 from datetime import datetime, timezone
@@ -15,6 +16,7 @@ from aiogram.types import (
     InlineKeyboardButton,
     CallbackQuery,
     FSInputFile,
+    BufferedInputFile,
     InputProfilePhotoStatic,
 )
 from aiogram.exceptions import TelegramNetworkError
@@ -26,6 +28,7 @@ from aiogram.exceptions import TelegramNetworkError
 # =========================================================
 
 TOKEN = "8675286625:AAEQ_l0pNg-TIMwi4tGu-J_PSZZlqeD4-1A"
+
 FFMPEG_PATH = os.getenv("FFMPEG_PATH", "ffmpeg").strip()
 
 SUPPORT_URL = "https://t.me/your_support"
@@ -638,6 +641,14 @@ def main_keyboard(user_id=None):
     ])
 
 
+    if ADMIN_ID and user_id == ADMIN_ID:
+        rows.append([
+            InlineKeyboardButton(
+                text="📋 Логи",
+                callback_data="open_admin_logs"
+            )
+        ])
+
 
     return InlineKeyboardMarkup(
         inline_keyboard=rows
@@ -657,32 +668,6 @@ def back_keyboard():
         ]
     )
 
-
-
-def admin_logs_keyboard():
-
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="🔄 Обновить",
-                    callback_data="open_admin_logs"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="📥 Скачать все логи",
-                    callback_data="download_admin_logs"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="⬅️ Назад",
-                    callback_data="open_menu"
-                )
-            ]
-        ]
-    )
 
 
 def commands_keyboard():
@@ -3841,6 +3826,120 @@ async def open_admin_logs(
         text,
         admin_logs_keyboard(media_ids)
     )
+
+
+# =========================================================
+# DOWNLOAD ALL ADMIN LOGS
+# =========================================================
+
+@dp.callback_query(
+    lambda c: c.data == "download_admin_logs"
+)
+async def download_admin_logs(
+    callback: CallbackQuery
+):
+
+    if not ADMIN_ID or callback.from_user.id != ADMIN_ID:
+        await callback.answer(
+            "⛔ Доступ только для администратора.",
+            show_alert=True
+        )
+        return
+
+    try:
+        # Обязательно закрываем "часики" у callback сразу.
+        await callback.answer(
+            "⏳ Формирую файл логов..."
+        )
+
+        cursor.execute("""
+            SELECT
+                id,
+                connection_id,
+                chat_id,
+                message_id,
+                user_id,
+                username,
+                first_name,
+                last_name,
+                text,
+                date,
+                media_type,
+                file_id,
+                deleted
+            FROM messages
+            ORDER BY id ASC
+        """)
+
+        rows = cursor.fetchall()
+
+        output = StringIO()
+
+        # Excel-friendly UTF-8 CSV.
+        output.write(
+            "ID;Connection ID;Chat ID;Message ID;"
+            "User ID;Username;First Name;Last Name;"
+            "Text;Date;Media Type;File ID;Deleted\n"
+        )
+
+        for row in rows:
+            values = []
+
+            for value in row:
+                value = "" if value is None else str(value)
+                value = value.replace('"', '""')
+                values.append(f'"{value}"')
+
+            output.write(
+                ";".join(values) + "\n"
+            )
+
+        data = (
+            "\ufeff" + output.getvalue()
+        ).encode("utf-8")
+
+        filename = (
+            "business_logs_"
+            + datetime.now().strftime(
+                "%Y-%m-%d_%H-%M-%S"
+            )
+            + ".csv"
+        )
+
+        await bot.send_document(
+            chat_id=ADMIN_ID,
+            document=BufferedInputFile(
+                data,
+                filename=filename
+            ),
+            caption=(
+                "📋 <b>Полный экспорт логов</b>\n\n"
+                f"📨 Сообщений: <b>{len(rows)}</b>\n"
+                f"📄 <code>{safe(filename)}</code>"
+            ),
+            parse_mode="HTML"
+        )
+
+        print(
+            f"📥 LOG EXPORT OK: {len(rows)} rows -> {filename}"
+        )
+
+    except Exception as error:
+
+        print(
+            "❌ LOG EXPORT ERROR:",
+            repr(error)
+        )
+
+        try:
+            await callback.message.answer(
+                "❌ <b>Не удалось скачать логи.</b>\n\n"
+                f"<code>{safe(error)}</code>",
+                parse_mode="HTML"
+            )
+        except Exception:
+            pass
+
 
 # =========================================================
 # COMMANDS PAGE
