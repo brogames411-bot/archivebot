@@ -592,19 +592,25 @@ def main_keyboard(user_id=None):
                 text="📊 Статистика",
                 callback_data="open_stats"
             )
-        ],
+        ]
+    ]
 
-    ],
+    # =====================================================
+    # 📋 ЛОГИ — ТОЛЬКО АДМИН
+    # =====================================================
 
-    # Логи добавляются только если настроен ADMIN_ID.
     if ADMIN_ID and user_id == ADMIN_ID:
-                rows.append([
-                    InlineKeyboardButton(
-                        text="📋 Логи",
-                        callback_data="open_admin_logs"
-                    )
-                ])
 
+        rows.append([
+            InlineKeyboardButton(
+                text="📋 Логи",
+                callback_data="open_admin_logs"
+            )
+        ])
+
+    # =====================================================
+    # ОСТАЛЬНЫЕ КНОПКИ
+    # =====================================================
 
     rows.extend([
 
@@ -628,29 +634,17 @@ def main_keyboard(user_id=None):
                 url=SUPPORT_URL
             )
         ]
+
     ])
-
-
 
     return InlineKeyboardMarkup(
         inline_keyboard=rows
     )
 
 
-def back_keyboard():
-
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="⬅️ Назад",
-                    callback_data="open_menu"
-                )
-            ]
-        ]
-    )
-
-
+# =========================================================
+# COMMANDS KEYBOARD
+# =========================================================
 
 def commands_keyboard():
 
@@ -670,7 +664,6 @@ def commands_keyboard():
                     callback_data="command_copy"
                 )
             ],
-
 
             [
                 InlineKeyboardButton(
