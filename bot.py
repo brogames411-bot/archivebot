@@ -664,7 +664,12 @@ def commands_keyboard():
                     callback_data="command_copy"
                 )
             ],
-
+            [
+                InlineKeyboardButton(
+                    text="🔳 QR-код",
+                    callback_data="command_qr"
+                )
+            ],
             [
                 InlineKeyboardButton(
                     text="🎬 Конвертер",
@@ -1261,7 +1266,35 @@ async def send_saved_to_admin(
         except Exception:
             pass
 
+@dp.callback_query(
+    lambda c: c.data == "command_qr"
+)
+async def command_qr(
+    callback: CallbackQuery
+):
 
+    text = (
+        "🔳 <b>QR-код</b>\n\n"
+        "Отправь мне ссылку или любой текст, "
+        "и я превращу его в QR-код.\n\n"
+        "Например:\n"
+        "<code>https://google.com</code>"
+    )
+
+    await replace_menu(
+        callback,
+        text,
+        InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text="⬅️ К командам",
+                        callback_data="open_commands"
+                    )
+                ]
+            ]
+        )
+    )
 @dp.business_message(
     F.text == ".save"
 )
