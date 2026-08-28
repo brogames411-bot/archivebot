@@ -7,7 +7,7 @@ from io import StringIO
 import uuid
 import shutil
 from datetime import datetime, timezone
-
+import qrcode
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
 from aiogram.types import (
@@ -210,7 +210,7 @@ active_spam_tasks = {}
 
 converter_users = set()
 audio_converter_users = set()
-
+qr_users = set()
 # =========================================================
 # MOSCOW TIME
 # =========================================================
@@ -1273,27 +1273,57 @@ async def command_qr(
     callback: CallbackQuery
 ):
 
-    text = (
-        "🔳 <b>QR-код</b>\n\n"
-        "Отправь мне ссылку или любой текст, "
-        "и я превращу его в QR-код.\n\n"
-        "Например:\n"
-        "<code>https://google.com</code>"
-    )
+    user_id = callback.from_user.id
+
+    qr_users.add(user_id)
 
     await replace_menu(
         callback,
-        text,
+
+        "🔳 <b>QR-код</b>\n\n"
+        "Отправь мне ссылку или любой текст, "
+        "и я превращу его в QR-код.\n\n"
+
+        "Например:\n"
+        "<code>https://google.com</code>\n\n"
+
+        "📱 После отправки я сразу пришлю "
+        "готовый QR-код.",
+
         InlineKeyboardMarkup(
             inline_keyboard=[
                 [
                     InlineKeyboardButton(
-                        text="⬅️ К командам",
-                        callback_data="open_commands"
+                        text="❌ Отмена",
+                        callback_data="cancel_qr"
                     )
                 ]
             ]
         )
+    )
+
+@dp.callback_query(
+    lambda c: c.data == "cancel_qr"
+)
+async def cancel_qr(
+    callback: CallbackQuery
+):
+
+    qr_users.discard(
+        callback.from_user.id
+    )
+
+    await show_main_menu(
+        owner_id=callback.from_user.id,
+        chat_id=callback.message.chat.id,
+        first_name=(
+            callback.from_user.first_name
+            or "друг"
+        )
+    )
+
+    await callback.answer(
+        "Создание QR отменено."
     )
 @dp.business_message(
     F.text == ".save"
@@ -3533,7 +3563,141 @@ async def deleted_business_messages_handler(
                 "❌ MEDIA DELETE ERROR:",
                 repr(error)
             )
+# =========================================================
+# QR CODE GENERATOR
+# =========================================================
 
+@dp.message(F.text)
+async def qr_message_handler(
+    message: types.Message
+):
+
+    user_id = (
+        message.from_user.id
+        if message.from_user
+        else 0
+    )
+
+    # Пользователь сейчас не находится
+    # в режиме создания QR
+    if user_id not in qr_users:
+        return
+
+    text = (
+        message.text or ""
+    ).strip()
+
+    if not text:
+        return
+
+    qr_users.discard(
+        user_id
+    )
+
+    qr_path = (
+        f"qr_{uuid.uuid4().hex}.png"
+    )
+
+    status = None
+
+    try:
+
+        status = await message.answer(
+            "⏳ <b>Создаю QR-код...</b>",
+            parse_mode="HTML"
+        )
+
+        # -------------------------------------------------
+        # GENERATE QR
+        # -------------------------------------------------
+
+        qr = qrcode.QRCode(
+            version=None,
+            error_correction=qrcode.constants.ERROR_CORRECT_M,
+            box_size=10,
+            border=4
+        )
+
+        qr.add_data(text)
+        qr.make(
+            fit=True
+        )
+
+        image = qr.make_image()
+
+        image.save(
+            qr_path
+        )
+
+        # -------------------------------------------------
+        # DELETE STATUS
+        # -------------------------------------------------
+
+        try:
+            await status.delete()
+        except Exception:
+            pass
+
+        # -------------------------------------------------
+        # SEND QR
+        # -------------------------------------------------
+
+        await bot.send_photo(
+            chat_id=message.chat.id,
+            photo=FSInputFile(qr_path),
+            caption=(
+                "🔳 <b>QR-код готов!</b>\n\n"
+                "📎 <b>Данные:</b>\n"
+                f"<code>{safe(text[:1000])}</code>"
+            ),
+            parse_mode="HTML"
+        )
+
+        # Удаляем сообщение со ссылкой
+        try:
+            await message.delete()
+        except Exception:
+            pass
+
+        # Возвращаем главное меню
+        await show_main_menu(
+            owner_id=user_id,
+            chat_id=message.chat.id,
+            first_name=(
+                message.from_user.first_name
+                or "друг"
+            )
+        )
+
+    except Exception as error:
+
+        print(
+            "❌ QR ERROR:",
+            repr(error)
+        )
+
+        try:
+            if status:
+                await status.delete()
+        except Exception:
+            pass
+
+        await message.answer(
+            "❌ <b>Не удалось создать QR-код.</b>\n\n"
+            f"<code>{safe(error)}</code>",
+            parse_mode="HTML"
+        )
+
+    finally:
+
+        try:
+            if os.path.exists(qr_path):
+                os.remove(qr_path)
+        except Exception as error:
+            print(
+                "⚠️ QR CLEANUP ERROR:",
+                repr(error)
+            )
 
 # =========================================================
 # /START
