@@ -28,7 +28,7 @@ from aiogram.exceptions import TelegramNetworkError
 # =========================================================
 
 
-TOKEN = os.getenv("8675286625:AAEQ_l0pNg-TIMwi4tGu-J_PSZZlqeD4-1A", "").strip()
+TOKEN = os.getenv("BOT_TOKEN", "").strip()
 FFMPEG_PATH = os.getenv("FFMPEG_PATH", "ffmpeg").strip()
 
 SUPPORT_URL = "https://t.me/your_support"
