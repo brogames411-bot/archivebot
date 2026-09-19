@@ -27,8 +27,8 @@ from aiogram.exceptions import TelegramNetworkError
 # CONFIG
 # =========================================================
 
-TOKEN = "8675286625:AAEQ_l0pNg-TIMwi4tGu-J_PSZZlqeD4-1A"
 
+TOKEN = os.getenv("8675286625:AAEQ_l0pNg-TIMwi4tGu-J_PSZZlqeD4-1A", "").strip()
 FFMPEG_PATH = os.getenv("FFMPEG_PATH", "ffmpeg").strip()
 
 SUPPORT_URL = "https://t.me/your_support"
@@ -5326,16 +5326,18 @@ async def private_deleted_command(
     )
 
 
-# =========================================================
+## =========================================================
 # MAIN
 # =========================================================
 
 async def main():
 
     if not TOKEN:
+
         print(
             "❌ BOT_TOKEN не задан."
         )
+
         return
 
     print()
@@ -5343,6 +5345,10 @@ async def main():
     print("🚀 BUSINESS ARCHIVE ЗАПУЩЕН")
     print("=" * 60)
     print()
+
+    # -----------------------------------------------------
+    # FFmpeg
+    # -----------------------------------------------------
 
     actual_ffmpeg = (
         FFMPEG_PATH
@@ -5355,18 +5361,136 @@ async def main():
         actual_ffmpeg or "НЕ НАЙДЕН"
     )
 
+    # -----------------------------------------------------
+    # ADMIN
+    # -----------------------------------------------------
+
     print(
         "ADMIN_ID:",
         ADMIN_ID
     )
 
+    # -----------------------------------------------------
+    # FFMPEG STATUS
+    # -----------------------------------------------------
+
     if actual_ffmpeg:
-        print("✅ FFmpeg найден")
+
+        print(
+            "✅ FFmpeg найден"
+        )
+
     else:
-        print("❌ FFmpeg НЕ найден!")
+
+        print(
+            "❌ FFmpeg НЕ найден!"
+        )
 
     print()
-    await dp.start_polling(bot)
+
+    # =====================================================
+    # WEBHOOK
+    # =====================================================
+    #
+    # Мы используем polling:
+    #
+    #     dp.start_polling(bot)
+    #
+    # Поэтому старый webhook необходимо удалить.
+    #
+    # drop_pending_updates=False
+    # означает, что накопившиеся обновления НЕ удаляются.
+    #
+    # =====================================================
+
+    try:
+
+        webhook_info = await bot.get_webhook_info()
+
+        print(
+            "🌐 Webhook URL:",
+            webhook_info.url or "не установлен"
+        )
+
+        print(
+            "📦 Pending updates:",
+            webhook_info.pending_update_count
+        )
+
+        if webhook_info.url:
+
+            print(
+                "⚠️ Обнаружен активный webhook."
+            )
+
+            print(
+                "🗑 Удаляем webhook..."
+            )
+
+            await bot.delete_webhook(
+                drop_pending_updates=False
+            )
+
+            print(
+                "✅ Webhook успешно удалён."
+            )
+
+        else:
+
+            print(
+                "✅ Webhook не установлен."
+            )
+
+    except Exception as error:
+
+        print()
+        print(
+            "❌ WEBHOOK ERROR:"
+        )
+        print(
+            repr(error)
+        )
+        print()
+
+        return
+
+    # =====================================================
+    # START POLLING
+    # =====================================================
+
+    print()
+    print(
+        "📡 Запускаю polling..."
+    )
+    print()
+
+    try:
+
+        await dp.start_polling(
+            bot
+        )
+
+    except TelegramNetworkError as error:
+
+        print()
+        print(
+            "🌐 TELEGRAM NETWORK ERROR:"
+        )
+        print(
+            repr(error)
+        )
+        print()
+
+    except Exception as error:
+
+        print()
+        print(
+            "❌ POLLING ERROR:"
+        )
+        print(
+            repr(error)
+        )
+        print()
 
 
 # =========================================================
@@ -5374,4 +5498,16 @@ async def main():
 # =========================================================
 
 if __name__ == "__main__":
-    asyncio.run(main())
+
+    try:
+
+        asyncio.run(
+            main()
+        )
+
+    except KeyboardInterrupt:
+
+        print()
+        print(
+            "🛑 BUSINESS ARCHIVE ОСТАНОВЛЕН"
+        )
