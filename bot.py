@@ -5466,9 +5466,14 @@ async def main():
 
     try:
 
-        await dp.start_polling(
-            bot
-        )
+        print("🗑 Удаляем webhook...")
+        await bot.delete_webhook(drop_pending_updates=False)
+        
+        webhook = await bot.get_webhook_info()
+        print("🌐 Webhook после удаления:", webhook.url or "пусто")
+        
+        print("📡 Запускаю polling...")
+        await dp.start_polling(bot)
 
     except TelegramNetworkError as error:
 
