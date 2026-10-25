@@ -87,7 +87,10 @@ CREATE TABLE IF NOT EXISTS business_connections (
 
     created_at TEXT,
 
-    last_chat_id INTEGER
+    last_chat_id INTEGER,
+    owner_username TEXT,
+    owner_first_name TEXT,
+    owner_last_name TEXT
 )
 """)
 
@@ -98,6 +101,14 @@ try:
     """)
 except sqlite3.OperationalError:
     pass
+
+for column in ("owner_username", "owner_first_name", "owner_last_name"):
+    try:
+        cursor.execute(
+            f"ALTER TABLE business_connections ADD COLUMN {column} TEXT"
+        )
+    except sqlite3.OperationalError:
+        pass
 
 
 # =========================================================
@@ -117,6 +128,10 @@ CREATE TABLE IF NOT EXISTS messages (
     first_name TEXT,
     last_name TEXT,
 
+    chat_username TEXT,
+    chat_first_name TEXT,
+    chat_last_name TEXT,
+
     text TEXT,
     date TEXT,
 
@@ -128,6 +143,14 @@ CREATE TABLE IF NOT EXISTS messages (
     UNIQUE(connection_id, chat_id, message_id)
 )
 """)
+
+for column in ("chat_username", "chat_first_name", "chat_last_name"):
+    try:
+        cursor.execute(
+            f"ALTER TABLE messages ADD COLUMN {column} TEXT"
+        )
+    except sqlite3.OperationalError:
+        pass
 
 
 # =========================================================
@@ -326,81 +349,55 @@ def save_connection(
     connection,
     last_chat_id=None
 ):
+    owner = connection.user
+    common = (
+        connection.id,
+        owner.id,
+        connection.user_chat_id,
+        int(connection.is_enabled),
+        datetime.now(timezone.utc).isoformat(),
+        getattr(owner, "username", None),
+        getattr(owner, "first_name", None),
+        getattr(owner, "last_name", None),
+    )
 
     if last_chat_id is None:
-
         cursor.execute("""
             INSERT INTO business_connections (
-                connection_id,
-                owner_id,
-                user_chat_id,
-                enabled,
-                created_at
+                connection_id, owner_id, user_chat_id, enabled, created_at,
+                owner_username, owner_first_name, owner_last_name
             )
-
-            VALUES (?, ?, ?, ?, ?)
-
-            ON CONFLICT(connection_id)
-
-            DO UPDATE SET
-                owner_id = excluded.owner_id,
-                user_chat_id = excluded.user_chat_id,
-                enabled = excluded.enabled
-        """, (
-            connection.id,
-            connection.user.id,
-            connection.user_chat_id,
-            int(connection.is_enabled),
-            datetime.now(
-                timezone.utc
-            ).isoformat()
-        ))
-
-    else:
-
-        cursor.execute("""
-            INSERT INTO business_connections (
-                connection_id,
-                owner_id,
-                user_chat_id,
-                enabled,
-                created_at,
-                last_chat_id
-            )
-
-            VALUES (?, ?, ?, ?, ?, ?)
-
-            ON CONFLICT(connection_id)
-
-            DO UPDATE SET
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(connection_id) DO UPDATE SET
                 owner_id = excluded.owner_id,
                 user_chat_id = excluded.user_chat_id,
                 enabled = excluded.enabled,
-                last_chat_id = excluded.last_chat_id
-        """, (
-            connection.id,
-            connection.user.id,
-            connection.user_chat_id,
-            int(connection.is_enabled),
-            datetime.now(
-                timezone.utc
-            ).isoformat(),
-            last_chat_id
-        ))
+                owner_username = excluded.owner_username,
+                owner_first_name = excluded.owner_first_name,
+                owner_last_name = excluded.owner_last_name
+        """, common)
+    else:
+        cursor.execute("""
+            INSERT INTO business_connections (
+                connection_id, owner_id, user_chat_id, enabled, created_at,
+                last_chat_id, owner_username, owner_first_name, owner_last_name
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(connection_id) DO UPDATE SET
+                owner_id = excluded.owner_id,
+                user_chat_id = excluded.user_chat_id,
+                enabled = excluded.enabled,
+                last_chat_id = excluded.last_chat_id,
+                owner_username = excluded.owner_username,
+                owner_first_name = excluded.owner_first_name,
+                owner_last_name = excluded.owner_last_name
+        """, common[:5] + (last_chat_id,) + common[5:])
 
     cursor.execute("""
         INSERT OR IGNORE INTO settings (
-            owner_id,
-            delete_notifications,
-            save_media,
-            edit_notifications
-        )
-
-        VALUES (?, 1, 1, 1)
-    """, (
-        connection.user.id,
-    ))
-
+            owner_id, delete_notifications, save_media, edit_notifications
+        ) VALUES (?, 1, 1, 1)
+    """, (owner.id,))
     db.commit()
 
 
@@ -3074,47 +3071,31 @@ async def business_message_handler(
         media_type = "text"
         file_id = None
 
+    chat_username = getattr(message.chat, "username", None)
+    chat_first_name = getattr(message.chat, "first_name", None)
+    chat_last_name = getattr(message.chat, "last_name", None)
+
     cursor.execute("""
         INSERT OR REPLACE INTO messages (
-
-            connection_id,
-            chat_id,
-            message_id,
-
-            user_id,
-            username,
-            first_name,
-            last_name,
-
-            text,
-            date,
-
-            media_type,
-            file_id,
-
-            deleted
+            connection_id, chat_id, message_id,
+            user_id, username, first_name, last_name,
+            chat_username, chat_first_name, chat_last_name,
+            text, date, media_type, file_id, deleted
         )
-
-        VALUES (
-            ?, ?, ?,
-            ?, ?, ?, ?,
-            ?, ?,
-            ?, ?,
-            0
-        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
     """, (
         message.business_connection_id,
         message.chat.id,
         message.message_id,
-
         user_id,
         username,
         first_name,
         last_name,
-
+        chat_username,
+        chat_first_name,
+        chat_last_name,
         text,
         message.date.isoformat(),
-
         media_type,
         file_id
     ))
@@ -3262,47 +3243,31 @@ async def edited_business_message_handler(
         media_type = "text"
         file_id = None
 
+    chat_username = getattr(message.chat, "username", None)
+    chat_first_name = getattr(message.chat, "first_name", None)
+    chat_last_name = getattr(message.chat, "last_name", None)
+
     cursor.execute("""
         INSERT OR REPLACE INTO messages (
-
-            connection_id,
-            chat_id,
-            message_id,
-
-            user_id,
-            username,
-            first_name,
-            last_name,
-
-            text,
-            date,
-
-            media_type,
-            file_id,
-
-            deleted
+            connection_id, chat_id, message_id,
+            user_id, username, first_name, last_name,
+            chat_username, chat_first_name, chat_last_name,
+            text, date, media_type, file_id, deleted
         )
-
-        VALUES (
-            ?, ?, ?,
-            ?, ?, ?, ?,
-            ?, ?,
-            ?, ?,
-            0
-        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
     """, (
         message.business_connection_id,
         message.chat.id,
         message.message_id,
-
         user_id,
         username,
         first_name,
         last_name,
-
+        chat_username,
+        chat_first_name,
+        chat_last_name,
         new_text,
         message.date.isoformat(),
-
         media_type,
         file_id
     ))
@@ -3567,7 +3532,7 @@ async def deleted_business_messages_handler(
 # QR CODE GENERATOR
 # =========================================================
 
-@dp.message(F.text)
+@dp.message(F.text & ~F.text.startswith("/"))
 async def qr_message_handler(
     message: types.Message
 ):
@@ -3882,190 +3847,191 @@ async def my_business(
 # =========================================================
 
 
-def build_admin_logs_text(limit=20):
-
-    cursor.execute("""
+def _admin_log_select_sql():
+    return """
         SELECT
-            id,
-            message_id,
-            chat_id,
-            user_id,
-            username,
-            first_name,
-            last_name,
-            text,
-            date,
-            media_type
-        FROM messages
-        ORDER BY id DESC
-        LIMIT ?
-    """, (limit,))
+            m.id,
+            m.connection_id,
+            m.chat_id,
+            m.message_id,
+            m.user_id,
+            m.username,
+            m.first_name,
+            m.last_name,
+            m.chat_username,
+            m.chat_first_name,
+            m.chat_last_name,
+            m.text,
+            m.date,
+            m.media_type,
+            m.file_id,
+            m.deleted,
+            b.owner_id,
+            b.owner_username,
+            b.owner_first_name,
+            b.owner_last_name
+        FROM messages m
+        LEFT JOIN business_connections b
+          ON b.connection_id = m.connection_id
+    """
 
+
+def _admin_log_participants(row):
+    # Row columns are returned by _admin_log_select_sql().
+    (
+        db_id, connection_id, chat_id, message_id,
+        user_id, username, first_name, last_name,
+        chat_username, chat_first_name, chat_last_name,
+        msg_text, date, media_type, file_id, deleted,
+        owner_id, owner_username, owner_first_name, owner_last_name
+    ) = row
+
+    owner_name = " ".join(
+        part for part in (owner_first_name, owner_last_name) if part
+    ).strip()
+    if not owner_name:
+        owner_name = f"Владелец ID {owner_id}" if owner_id else "Владелец Business"
+    elif owner_username:
+        owner_name = f"{owner_name} (@{owner_username})"
+
+    peer_name = " ".join(
+        part for part in (chat_first_name, chat_last_name) if part
+    ).strip()
+    if not peer_name and chat_username:
+        peer_name = f"@{chat_username}"
+    if not peer_name:
+        # For older rows, the message sender may provide the best available peer name.
+        if user_id and owner_id and user_id != owner_id:
+            peer_name = " ".join(
+                part for part in (first_name, last_name) if part
+            ).strip()
+            if not peer_name and username:
+                peer_name = f"@{username}"
+        if not peer_name:
+            peer_name = f"Собеседник ID {chat_id}"
+
+    sender_name = " ".join(
+        part for part in (first_name, last_name) if part
+    ).strip()
+    if not sender_name and username:
+        sender_name = f"@{username}"
+    if not sender_name:
+        sender_name = f"Пользователь ID {user_id}" if user_id else peer_name
+
+    if owner_id and user_id == owner_id:
+        sender, recipient = owner_name, peer_name
+    elif user_id:
+        sender, recipient = sender_name, owner_name
+    else:
+        sender, recipient = peer_name, owner_name
+
+    return sender, recipient, owner_name, peer_name
+
+
+def _format_admin_log_row(row, index=None):
+    (
+        db_id, connection_id, chat_id, message_id,
+        user_id, username, first_name, last_name,
+        chat_username, chat_first_name, chat_last_name,
+        msg_text, date, media_type, file_id, deleted,
+        owner_id, owner_username, owner_first_name, owner_last_name
+    ) = row
+
+    sender, recipient, owner_name, peer_name = _admin_log_participants(row)
+
+    try:
+        time_text = moscow_time(datetime.fromisoformat(date))
+    except Exception:
+        time_text = str(date or "дата неизвестна")
+
+    clean_text = (msg_text or "").strip()
+    if not clean_text:
+        clean_text = "Медиа без подписи" if media_type != "text" else "Сообщение без текста"
+
+    lines = []
+    prefix = f"#{db_id} — " if index is None else f"#{index} (ID {db_id}) — "
+    lines.append(prefix + time_text)
+    lines.append(f"{sender} → {recipient}")
+    lines.append(f"Тип: {media_name(media_type)}")
+    lines.append(f"Текст: {clean_text}")
+    if deleted:
+        lines.append("Статус: УДАЛЕНО")
+    lines.append(f"Chat ID: {chat_id} | Message ID: {message_id}")
+    return "\n".join(lines)
+
+
+def build_admin_logs_text(limit=20, chat_id=None):
+    query = _admin_log_select_sql()
+    params = []
+    if chat_id is not None:
+        query += " WHERE m.chat_id = ?"
+        params.append(chat_id)
+    query += " ORDER BY m.id DESC LIMIT ?"
+    params.append(limit)
+    cursor.execute(query, params)
     rows = cursor.fetchall()
 
     if not rows:
-        return (
-            "📋 <b>Логи</b>\n\n"
-            "Пока нет сохранённых сообщений."
-        )
+        if chat_id is None:
+            return "📋 <b>Логи Business-переписки</b>\n\nПока нет сохранённых сообщений."
+        return f"📋 <b>Логи пользователя ID {chat_id}</b>\n\nСообщений не найдено."
 
-    result = [
-        "📋 <b>Логи Business-сообщений</b>",
-        "",
-        f"Последние {len(rows)} сообщений:",
-        ""
-    ]
+    title = "📋 <b>Последние логи Business-переписки</b>"
+    if chat_id is not None:
+        title = f"📋 <b>Логи пользователя ID {chat_id}</b>"
+    result = [title, "", f"Показано сообщений: {len(rows)}", ""]
 
-    for row in rows:
-        (
-            db_id,
-            message_id,
-            chat_id,
-            user_id,
-            username,
-            first_name,
-            last_name,
-            msg_text,
-            date,
-            media_type
-        ) = row
+    for row in reversed(rows):
+        formatted = _format_admin_log_row(row)
+        result.append(safe(formatted))
+        result.append("────────────────────")
 
-        name = " ".join(
-            part for part in [first_name, last_name]
-            if part
-        ).strip() or "Неизвестный пользователь"
-
-        username_text = (
-            f"@{username}"
-            if username
-            else "нет username"
-        )
-
-        try:
-            time_text = moscow_time(
-                datetime.fromisoformat(date)
-            )
-        except Exception:
-            time_text = str(date)
-
-        icons = {
-            "text": "💬",
-            "photo": "🖼",
-            "video": "🎬",
-            "document": "📄",
-            "audio": "🎵",
-            "voice": "🎤",
-            "animation": "🎞",
-            "video_note": "⭕",
-            "sticker": "🧩"
-        }
-
-        icon = icons.get(
-            media_type,
-            "📦"
-        )
-
-        clean_text = (
-            msg_text or ""
-        ).replace(
-            "\n",
-            " "
-        ).strip()
-
-        if len(clean_text) > 100:
-            clean_text = clean_text[:100] + "…"
-
-        if not clean_text:
-            clean_text = (
-                "Медиа"
-                if media_type != "text"
-                else "Без текста"
-            )
-
-        result.append(
-            f"<b>#{db_id}</b> "
-            f"👤 <b>{safe(name)}</b> "
-            f"{safe(username_text)}\n"
-            f"🆔 <code>{user_id or '—'}</code>\n"
-            f"💬 Chat: <code>{chat_id}</code> | "
-            f"📨 <code>{message_id}</code>\n"
-            f"🕐 {safe(time_text)}\n"
-            f"{icon} {safe(clean_text)}"
-        )
-
-        if media_type != "text":
-            result.append(
-                f"📎 Медиа: <b>#{db_id}</b>"
-            )
-
-        result.append("")
-
-    return "\n".join(result)
+    text = "\n".join(result)
+    # Telegram message length cap; keep latest tail if needed.
+    if len(text) > 3900:
+        text = "… (часть логов скрыта; скачай TXT для полного архива)\n\n" + text[-3750:]
+    return text
 
 
-def get_recent_admin_log_media(limit=20):
-
-    cursor.execute("""
+def get_recent_admin_log_media(limit=20, chat_id=None):
+    query = """
         SELECT id, media_type
         FROM messages
-        WHERE media_type != "text"
+        WHERE media_type != 'text'
           AND file_id IS NOT NULL
-        ORDER BY id DESC
-        LIMIT ?
-    """, (limit,))
-
+    """
+    params = []
+    if chat_id is not None:
+        query += " AND chat_id = ?"
+        params.append(chat_id)
+    query += " ORDER BY id DESC LIMIT ?"
+    params.append(limit)
+    cursor.execute(query, params)
     return cursor.fetchall()
 
 
-def admin_logs_keyboard(log_ids=None):
-
+def admin_logs_keyboard(log_ids=None, chat_id=None):
+    refresh_data = "open_admin_logs" if chat_id is None else f"open_admin_logs_user:{chat_id}"
+    download_data = "download_admin_logs" if chat_id is None else f"download_admin_logs_user:{chat_id}"
     rows = [
-        [
-            InlineKeyboardButton(
-                text="🔄 Обновить",
-                callback_data="open_admin_logs"
-            )
-        ]
+        [InlineKeyboardButton(text="🔄 Обновить", callback_data=refresh_data)],
+        [InlineKeyboardButton(text="👥 Фильтр по пользователю", callback_data="admin_logs_users")],
     ]
 
     if log_ids:
-        media_row = []
-
-        for db_id, media_type in log_ids:
-
-            media_row.append(
+        for db_id, media_type in log_ids[:10]:
+            rows.append([
                 InlineKeyboardButton(
-                    text=f"📎 Открыть #{db_id}",
+                    text=f"📎 Открыть медиа #{db_id}",
                     callback_data=f"open_log_media:{db_id}"
                 )
-            )
-
-            if len(media_row) == 1:
-                rows.append(media_row)
-                media_row = []
-
-        if media_row:
-            rows.append(media_row)
+            ])
 
     rows.extend([
-        [
-            InlineKeyboardButton(
-                text="📥 Скачать все логи",
-                callback_data="download_admin_logs"
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                text="⬅️ Назад",
-                callback_data="open_menu"
-            )
-        ]
+        [InlineKeyboardButton(text="📥 Скачать TXT", callback_data=download_data)],
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="open_menu")],
     ])
-
-    return InlineKeyboardMarkup(
-        inline_keyboard=rows
-    )
-
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 @dp.callback_query(
@@ -4257,133 +4223,216 @@ async def open_log_media(
 @dp.callback_query(
     lambda c: c.data == "open_admin_logs"
 )
-async def open_admin_logs(
-    callback: CallbackQuery
-):
-
+async def open_admin_logs(callback: CallbackQuery):
     if not ADMIN_ID or callback.from_user.id != ADMIN_ID:
-        await callback.answer(
-            "⛔ Доступ только для администратора.",
-            show_alert=True
-        )
+        await callback.answer("⛔ Доступ только для администратора.", show_alert=True)
         return
 
     text = build_admin_logs_text(20)
     media_ids = get_recent_admin_log_media(20)
+    await replace_menu(callback, text, admin_logs_keyboard(media_ids))
 
+
+@dp.callback_query(
+    lambda c: c.data == "admin_logs_users"
+)
+async def admin_logs_users(callback: CallbackQuery):
+    if not ADMIN_ID or callback.from_user.id != ADMIN_ID:
+        await callback.answer("⛔ Доступ только для администратора.", show_alert=True)
+        return
+
+    cursor.execute("""
+        SELECT m.chat_id, m.chat_first_name, m.chat_last_name, m.chat_username,
+               COUNT(*) AS message_count, MAX(m.id) AS last_id
+        FROM messages m
+        GROUP BY m.chat_id
+        ORDER BY last_id DESC
+        LIMIT 50
+    """)
+    rows = cursor.fetchall()
+
+    if not rows:
+        await callback.answer("Пока нет сообщений для фильтра.", show_alert=True)
+        return
+
+    buttons = []
+    for chat_id, first_name, last_name, username, count, last_id in rows:
+        peer_name = " ".join(x for x in (first_name, last_name) if x).strip()
+        if not peer_name and username:
+            peer_name = f"@{username}"
+        if not peer_name:
+            peer_name = f"ID {chat_id}"
+        if len(peer_name) > 32:
+            peer_name = peer_name[:29] + "..."
+        buttons.append([InlineKeyboardButton(
+            text=f"👤 {peer_name} ({count})",
+            callback_data=f"admin_logs_user:{chat_id}"
+        )])
+
+    buttons.append([InlineKeyboardButton(text="⬅️ К логам", callback_data="open_admin_logs")])
     await replace_menu(
         callback,
-        text,
-        admin_logs_keyboard(media_ids)
+        "👥 <b>Фильтр логов по пользователю</b>\n\nВыбери собеседника. В скобках — количество сохранённых сообщений.",
+        InlineKeyboardMarkup(inline_keyboard=buttons)
     )
+
+
+@dp.callback_query(
+    lambda c: c.data.startswith("admin_logs_user:")
+)
+async def admin_logs_user(callback: CallbackQuery):
+    if not ADMIN_ID or callback.from_user.id != ADMIN_ID:
+        await callback.answer("⛔ Доступ только для администратора.", show_alert=True)
+        return
+    try:
+        chat_id = int(callback.data.split(":", 1)[1])
+    except (ValueError, IndexError):
+        await callback.answer("Некорректный пользователь.", show_alert=True)
+        return
+
+    text = build_admin_logs_text(20, chat_id=chat_id)
+    media_ids = get_recent_admin_log_media(10, chat_id=chat_id)
+    await replace_menu(callback, text, admin_logs_keyboard(media_ids, chat_id=chat_id))
+
+
+@dp.callback_query(
+    lambda c: c.data.startswith("open_admin_logs_user:")
+)
+async def refresh_admin_logs_user(callback: CallbackQuery):
+    if not ADMIN_ID or callback.from_user.id != ADMIN_ID:
+        await callback.answer("⛔ Доступ только для администратора.", show_alert=True)
+        return
+    try:
+        chat_id = int(callback.data.split(":", 1)[1])
+    except (ValueError, IndexError):
+        await callback.answer("Некорректный пользователь.", show_alert=True)
+        return
+    text = build_admin_logs_text(20, chat_id=chat_id)
+    media_ids = get_recent_admin_log_media(10, chat_id=chat_id)
+    await replace_menu(callback, text, admin_logs_keyboard(media_ids, chat_id=chat_id))
+
+
+@dp.message(Command("logs"))
+async def admin_logs_command(message: types.Message):
+    if not ADMIN_ID or not message.from_user or message.from_user.id != ADMIN_ID:
+        await message.answer("⛔ Команда доступна только администратору.")
+        return
+    text = build_admin_logs_text(20)
+    media_ids = get_recent_admin_log_media(20)
+    await message.answer(text, parse_mode="HTML", reply_markup=admin_logs_keyboard(media_ids))
 
 
 # =========================================================
 # DOWNLOAD ALL ADMIN LOGS
 # =========================================================
 
+def build_admin_logs_file(chat_id=None):
+    query = _admin_log_select_sql()
+    params = []
+    if chat_id is not None:
+        query += " WHERE m.chat_id = ?"
+        params.append(chat_id)
+    query += " ORDER BY m.connection_id, m.chat_id, m.date ASC, m.id ASC"
+    cursor.execute(query, params)
+    rows = cursor.fetchall()
+
+    if not rows:
+        return None, 0
+
+    lines = [
+        "BUSINESS ARCHIVE — ЛОГИ ПЕРЕПИСКИ",
+        f"Создано: {moscow_time()}",
+        f"Количество сообщений: {len(rows)}",
+        "Фильтр: все пользователи" if chat_id is None else f"Фильтр: пользователь Chat ID {chat_id}",
+        "=" * 72,
+        "",
+    ]
+
+    current_group = None
+    for row in rows:
+        _, connection_id, row_chat_id = row[0], row[1], row[2]
+        group = (connection_id, row_chat_id)
+        if group != current_group:
+            current_group = group
+            sender, recipient, owner_name, peer_name = _admin_log_participants(row)
+            lines.extend([
+                "",
+                "#" * 72,
+                f"ДИАЛОГ: {owner_name} ↔ {peer_name}",
+                f"Chat ID: {row_chat_id}",
+                f"Business connection: {connection_id}",
+                "#" * 72,
+                "",
+            ])
+        lines.append(_format_admin_log_row(row))
+        lines.append("-" * 72)
+        lines.append("")
+
+    return "\n".join(lines), len(rows)
+
+
+async def _send_admin_logs_document(callback: CallbackQuery, chat_id_filter=None):
+    if not ADMIN_ID or callback.from_user.id != ADMIN_ID:
+        await callback.answer("⛔ Доступ только для администратора.", show_alert=True)
+        return
+
+    await callback.answer("⏳ Формирую TXT-файл...")
+    content, count = build_admin_logs_file(chat_id=chat_id_filter)
+    if content is None:
+        await callback.message.answer("📋 По выбранному фильтру логов пока нет.")
+        return
+
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    suffix = "all" if chat_id_filter is None else f"chat_{chat_id_filter}"
+    filename = f"business_logs_{suffix}_{timestamp}.txt"
+    document = BufferedInputFile(content.encode("utf-8"), filename=filename)
+
+    await bot.send_document(
+        chat_id=ADMIN_ID,
+        document=document,
+        caption=(
+            "📋 <b>Экспорт логов переписки</b>\n\n"
+            f"📨 Сообщений: <b>{count}</b>\n"
+            f"📄 Формат: <code>TXT</code>\n"
+            f"🔎 Фильтр: <code>{safe(suffix)}</code>"
+        ),
+        parse_mode="HTML"
+    )
+    print(f"📥 TXT LOG EXPORT OK: {count} rows -> {filename}")
+
+
 @dp.callback_query(
     lambda c: c.data == "download_admin_logs"
 )
-async def download_admin_logs(
-    callback: CallbackQuery
-):
-
-    if not ADMIN_ID or callback.from_user.id != ADMIN_ID:
-        await callback.answer(
-            "⛔ Доступ только для администратора.",
-            show_alert=True
-        )
-        return
-
+async def download_admin_logs(callback: CallbackQuery):
     try:
-        # Обязательно закрываем "часики" у callback сразу.
-        await callback.answer(
-            "⏳ Формирую файл логов..."
-        )
-
-        cursor.execute("""
-            SELECT
-                id,
-                connection_id,
-                chat_id,
-                message_id,
-                user_id,
-                username,
-                first_name,
-                last_name,
-                text,
-                date,
-                media_type,
-                file_id,
-                deleted
-            FROM messages
-            ORDER BY id ASC
-        """)
-
-        rows = cursor.fetchall()
-
-        output = StringIO()
-
-        # Excel-friendly UTF-8 CSV.
-        output.write(
-            "ID;Connection ID;Chat ID;Message ID;"
-            "User ID;Username;First Name;Last Name;"
-            "Text;Date;Media Type;File ID;Deleted\n"
-        )
-
-        for row in rows:
-            values = []
-
-            for value in row:
-                value = "" if value is None else str(value)
-                value = value.replace('"', '""')
-                values.append(f'"{value}"')
-
-            output.write(
-                ";".join(values) + "\n"
-            )
-
-        data = (
-            "\ufeff" + output.getvalue()
-        ).encode("utf-8")
-
-        filename = (
-            "business_logs_"
-            + datetime.now().strftime(
-                "%Y-%m-%d_%H-%M-%S"
-            )
-            + ".csv"
-        )
-
-        await bot.send_document(
-            chat_id=ADMIN_ID,
-            document=BufferedInputFile(
-                data,
-                filename=filename
-            ),
-            caption=(
-                "📋 <b>Полный экспорт логов</b>\n\n"
-                f"📨 Сообщений: <b>{len(rows)}</b>\n"
-                f"📄 <code>{safe(filename)}</code>"
-            ),
-            parse_mode="HTML"
-        )
-
-        print(
-            f"📥 LOG EXPORT OK: {len(rows)} rows -> {filename}"
-        )
-
+        await _send_admin_logs_document(callback)
     except Exception as error:
-
-        print(
-            "❌ LOG EXPORT ERROR:",
-            repr(error)
-        )
-
+        print("❌ LOG TXT EXPORT ERROR:", repr(error))
         try:
             await callback.message.answer(
-                "❌ <b>Не удалось скачать логи.</b>\n\n"
+                "❌ <b>Не удалось сформировать TXT-логи.</b>\n\n"
+                f"<code>{safe(error)}</code>",
+                parse_mode="HTML"
+            )
+        except Exception:
+            pass
+
+
+@dp.callback_query(
+    lambda c: c.data.startswith("download_admin_logs_user:")
+)
+async def download_admin_logs_user(callback: CallbackQuery):
+    try:
+        chat_id_filter = int(callback.data.split(":", 1)[1])
+        await _send_admin_logs_document(callback, chat_id_filter=chat_id_filter)
+    except (ValueError, IndexError):
+        await callback.answer("Некорректный фильтр.", show_alert=True)
+    except Exception as error:
+        print("❌ FILTERED TXT EXPORT ERROR:", repr(error))
+        try:
+            await callback.message.answer(
+                "❌ <b>Не удалось сформировать TXT-логи.</b>\n\n"
                 f"<code>{safe(error)}</code>",
                 parse_mode="HTML"
             )
