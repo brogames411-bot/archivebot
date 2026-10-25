@@ -3876,6 +3876,100 @@ def _admin_log_select_sql():
     """
 
 
+def _display_person_name(first_name=None, last_name=None, username=None, user_id=None):
+    """Prefer @username; fall back to the Telegram display name, then ID."""
+    if username:
+        return f"@{username}"
+
+    display_name = " ".join(
+        part for part in (first_name, last_name) if part
+    ).strip()
+    if display_name:
+        return display_name
+
+    return f"ID {user_id}" if user_id else "Неизвестный пользователь"
+
+
+def _lookup_peer_name(connection_id, chat_id, owner_id=None,
+                      fallback_username=None, fallback_first_name=None,
+                      fallback_last_name=None):
+    """Look for the best-known customer identity across all archived rows.
+
+    Older messages may have been stored before chat_* identity columns were
+    populated, so also inspect other messages from the same conversation.
+    """
+    identity = None
+
+    if connection_id:
+        cursor.execute("""
+            SELECT chat_username, chat_first_name, chat_last_name
+            FROM messages
+            WHERE connection_id = ? AND chat_id = ?
+              AND (chat_username IS NOT NULL OR chat_first_name IS NOT NULL
+                   OR chat_last_name IS NOT NULL)
+            ORDER BY CASE WHEN chat_username IS NOT NULL THEN 0 ELSE 1 END,
+                     id DESC
+            LIMIT 1
+        """, (connection_id, chat_id))
+        identity = cursor.fetchone()
+
+        if not identity:
+            cursor.execute("""
+                SELECT m.username, m.first_name, m.last_name
+                FROM messages m
+                WHERE m.connection_id = ? AND m.chat_id = ?
+                  AND m.user_id IS NOT NULL
+                  AND (? IS NULL OR m.user_id != ?)
+                  AND (m.username IS NOT NULL OR m.first_name IS NOT NULL
+                       OR m.last_name IS NOT NULL)
+                ORDER BY CASE WHEN m.username IS NOT NULL THEN 0 ELSE 1 END,
+                         m.id DESC
+                LIMIT 1
+            """, (connection_id, chat_id, owner_id, owner_id))
+            identity = cursor.fetchone()
+    else:
+        cursor.execute("""
+            SELECT chat_username, chat_first_name, chat_last_name
+            FROM messages
+            WHERE chat_id = ?
+              AND (chat_username IS NOT NULL OR chat_first_name IS NOT NULL
+                   OR chat_last_name IS NOT NULL)
+            ORDER BY CASE WHEN chat_username IS NOT NULL THEN 0 ELSE 1 END,
+                     id DESC
+            LIMIT 1
+        """, (chat_id,))
+        identity = cursor.fetchone()
+
+        if not identity:
+            cursor.execute("""
+                SELECT m.username, m.first_name, m.last_name
+                FROM messages m
+                LEFT JOIN business_connections b
+                  ON b.connection_id = m.connection_id
+                WHERE m.chat_id = ? AND m.user_id IS NOT NULL
+                  AND (b.owner_id IS NULL OR m.user_id != b.owner_id)
+                  AND (m.username IS NOT NULL OR m.first_name IS NOT NULL
+                       OR m.last_name IS NOT NULL)
+                ORDER BY CASE WHEN m.username IS NOT NULL THEN 0 ELSE 1 END,
+                         m.id DESC
+                LIMIT 1
+            """, (chat_id,))
+            identity = cursor.fetchone()
+
+    if identity:
+        candidate = _display_person_name(
+            identity[1], identity[2], identity[0], chat_id
+        )
+        if candidate and not candidate.startswith("ID "):
+            return candidate
+
+    candidate = _display_person_name(
+        fallback_first_name, fallback_last_name,
+        fallback_username, chat_id
+    )
+    return candidate
+
+
 def _admin_log_participants(row):
     # Row columns are returned by _admin_log_select_sql().
     (
@@ -3886,42 +3980,29 @@ def _admin_log_participants(row):
         owner_id, owner_username, owner_first_name, owner_last_name
     ) = row
 
-    owner_name = " ".join(
-        part for part in (owner_first_name, owner_last_name) if part
-    ).strip()
-    if not owner_name:
-        owner_name = f"Владелец ID {owner_id}" if owner_id else "Владелец Business"
-    elif owner_username:
-        owner_name = f"{owner_name} (@{owner_username})"
+    owner_name = _display_person_name(
+        owner_first_name, owner_last_name, owner_username, owner_id
+    )
 
-    peer_name = " ".join(
-        part for part in (chat_first_name, chat_last_name) if part
-    ).strip()
-    if not peer_name and chat_username:
-        peer_name = f"@{chat_username}"
-    if not peer_name:
-        # For older rows, the message sender may provide the best available peer name.
-        if user_id and owner_id and user_id != owner_id:
-            peer_name = " ".join(
-                part for part in (first_name, last_name) if part
-            ).strip()
-            if not peer_name and username:
-                peer_name = f"@{username}"
-        if not peer_name:
-            peer_name = f"Собеседник ID {chat_id}"
+    peer_name = _lookup_peer_name(
+        connection_id=connection_id,
+        chat_id=chat_id,
+        owner_id=owner_id,
+        fallback_username=chat_username or username,
+        fallback_first_name=chat_first_name or first_name,
+        fallback_last_name=chat_last_name or last_name,
+    )
 
-    sender_name = " ".join(
-        part for part in (first_name, last_name) if part
-    ).strip()
-    if not sender_name and username:
-        sender_name = f"@{username}"
-    if not sender_name:
-        sender_name = f"Пользователь ID {user_id}" if user_id else peer_name
+    sender_name = _display_person_name(
+        first_name, last_name, username, user_id
+    )
 
     if owner_id and user_id == owner_id:
         sender, recipient = owner_name, peer_name
     elif user_id:
-        sender, recipient = sender_name, owner_name
+        # Incoming messages should be attributed to the customer.
+        sender = sender_name if sender_name != f"ID {user_id}" else peer_name
+        recipient = owner_name
     else:
         sender, recipient = peer_name, owner_name
 
@@ -3974,11 +4055,13 @@ def build_admin_logs_text(limit=20, chat_id=None):
     if not rows:
         if chat_id is None:
             return "📋 <b>Логи Business-переписки</b>\n\nПока нет сохранённых сообщений."
-        return f"📋 <b>Логи пользователя ID {chat_id}</b>\n\nСообщений не найдено."
+        label = _lookup_peer_name(None, chat_id) if chat_id is not None else ""
+        return f"📋 <b>Логи: {safe(label)}</b>\n\nСообщений не найдено." if chat_id is not None else "📋 <b>Логи Business-переписки</b>\n\nПока нет сохранённых сообщений."
 
     title = "📋 <b>Последние логи Business-переписки</b>"
     if chat_id is not None:
-        title = f"📋 <b>Логи пользователя ID {chat_id}</b>"
+        label = _lookup_peer_name(None, chat_id)
+        title = f"📋 <b>Логи: {safe(label)}</b>"
     result = [title, "", f"Показано сообщений: {len(rows)}", ""]
 
     for row in reversed(rows):
@@ -4242,8 +4325,7 @@ async def admin_logs_users(callback: CallbackQuery):
         return
 
     cursor.execute("""
-        SELECT m.chat_id, m.chat_first_name, m.chat_last_name, m.chat_username,
-               COUNT(*) AS message_count, MAX(m.id) AS last_id
+        SELECT m.chat_id, COUNT(*) AS message_count, MAX(m.id) AS last_id
         FROM messages m
         GROUP BY m.chat_id
         ORDER BY last_id DESC
@@ -4256,12 +4338,11 @@ async def admin_logs_users(callback: CallbackQuery):
         return
 
     buttons = []
-    for chat_id, first_name, last_name, username, count, last_id in rows:
-        peer_name = " ".join(x for x in (first_name, last_name) if x).strip()
-        if not peer_name and username:
-            peer_name = f"@{username}"
-        if not peer_name:
-            peer_name = f"ID {chat_id}"
+    for chat_id, count, last_id in rows:
+        peer_name = _lookup_peer_name(
+            connection_id=None,
+            chat_id=chat_id,
+        )
         if len(peer_name) > 32:
             peer_name = peer_name[:29] + "..."
         buttons.append([InlineKeyboardButton(
