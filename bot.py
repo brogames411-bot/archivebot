@@ -3338,9 +3338,7 @@ async def deleted_business_messages_handler(
                 date,
                 media_type,
                 file_id
-
             FROM messages
-
             WHERE connection_id = ?
               AND chat_id = ?
               AND message_id = ?
@@ -3366,11 +3364,10 @@ async def deleted_business_messages_handler(
             file_id
         ) = row
 
+        # Помечаем сообщение как удалённое
         cursor.execute("""
             UPDATE messages
-
             SET deleted = 1
-
             WHERE connection_id = ?
               AND chat_id = ?
               AND message_id = ?
@@ -3388,39 +3385,55 @@ async def deleted_business_messages_handler(
             username
         )
 
+        # Определяем тип сообщения
+        media_names = {
+            "text": "💬 Текст",
+            "photo": "🖼 Фото",
+            "video": "🎥 Видео",
+            "video_note": "⭕️ Кружок",
+            "voice": "🎤 Голосовое",
+            "audio": "🎵 Аудио",
+            "document": "📎 Документ",
+            "animation": "🎞 GIF",
+            "sticker": "🎨 Стикер",
+        }
+
+        media_name = media_names.get(
+            media_type,
+            "📦 Медиа"
+        )
+
         header = (
             "🗑 <b>Удалено сообщение</b>\n\n"
 
             f"👤 <b>{safe(name)}</b>\n"
             f"🔹 {safe(username_text)}\n"
             f"🆔 <code>{user_id}</code>\n"
-            f"🕐 {safe(moscow_time(datetime.fromisoformat(date)))}\n\n"
+            f"🕐 {safe(moscow_time(datetime.fromisoformat(date)))}\n"
+            f"📦 {media_name}"
         )
 
-        if (
-            media_type == "text"
-            or not file_id
-        ):
+        # ─────────────────────────────
+        # ТЕКСТ
+        # ─────────────────────────────
+
+        if media_type == "text" or not file_id:
 
             try:
-
                 await bot.send_message(
                     chat_id=user_chat_id,
                     text=(
                         header +
-
+                        "\n\n"
                         "💬 <b>Сообщение:</b>\n"
-
-                        f"<blockquote>"
+                        "<blockquote>"
                         f"{safe(text or '—')}"
-                        f"</blockquote>"
+                        "</blockquote>"
                     ),
-
                     parse_mode="HTML"
                 )
 
             except Exception as error:
-
                 print(
                     "❌ DELETE NOTIFY ERROR:",
                     repr(error)
@@ -3428,11 +3441,14 @@ async def deleted_business_messages_handler(
 
             continue
 
+        # ─────────────────────────────
+        # Обычные медиа с caption
+        # ─────────────────────────────
+
         caption = (
             header +
-
+            "\n\n"
             "💬 <b>Текст:</b>\n"
-
             f"{safe(text or '—')}"
         )
 
@@ -3441,8 +3457,8 @@ async def deleted_business_messages_handler(
             if media_type == "photo":
 
                 await bot.send_photo(
-                    user_chat_id,
-                    file_id,
+                    chat_id=user_chat_id,
+                    photo=file_id,
                     caption=caption,
                     parse_mode="HTML"
                 )
@@ -3450,8 +3466,8 @@ async def deleted_business_messages_handler(
             elif media_type == "video":
 
                 await bot.send_video(
-                    user_chat_id,
-                    file_id,
+                    chat_id=user_chat_id,
+                    video=file_id,
                     caption=caption,
                     parse_mode="HTML"
                 )
@@ -3459,8 +3475,8 @@ async def deleted_business_messages_handler(
             elif media_type == "voice":
 
                 await bot.send_voice(
-                    user_chat_id,
-                    file_id,
+                    chat_id=user_chat_id,
+                    voice=file_id,
                     caption=caption,
                     parse_mode="HTML"
                 )
@@ -3468,8 +3484,8 @@ async def deleted_business_messages_handler(
             elif media_type == "document":
 
                 await bot.send_document(
-                    user_chat_id,
-                    file_id,
+                    chat_id=user_chat_id,
+                    document=file_id,
                     caption=caption,
                     parse_mode="HTML"
                 )
@@ -3477,8 +3493,8 @@ async def deleted_business_messages_handler(
             elif media_type == "audio":
 
                 await bot.send_audio(
-                    user_chat_id,
-                    file_id,
+                    chat_id=user_chat_id,
+                    audio=file_id,
                     caption=caption,
                     parse_mode="HTML"
                 )
@@ -3486,39 +3502,69 @@ async def deleted_business_messages_handler(
             elif media_type == "animation":
 
                 await bot.send_animation(
-                    user_chat_id,
-                    file_id,
+                    chat_id=user_chat_id,
+                    animation=file_id,
                     caption=caption,
                     parse_mode="HTML"
                 )
 
+            # ─────────────────────────
+            # КРУЖОК
+            # ─────────────────────────
+
             elif media_type == "video_note":
 
-                await bot.send_video_note(
-                    user_chat_id,
-                    file_id
+                # Сначала информация об удалении
+                await bot.send_message(
+                    chat_id=user_chat_id,
+                    text=header,
+                    parse_mode="HTML"
                 )
 
-                if text:
+                # Потом сам кружок
+                await bot.send_video_note(
+                    chat_id=user_chat_id,
+                    video_note=file_id
+                )
 
+                # Если был текст к сообщению
+                if text:
                     await bot.send_message(
-                        user_chat_id,
-                        caption,
+                        chat_id=user_chat_id,
+                        text=(
+                            "💬 <b>Текст:</b>\n"
+                            f"{safe(text)}"
+                        ),
                         parse_mode="HTML"
                     )
 
+            # ─────────────────────────
+            # СТИКЕР
+            # ─────────────────────────
+
             elif media_type == "sticker":
 
-                await bot.send_sticker(
-                    user_chat_id,
-                    file_id
+                # Сначала информация об удалении
+                await bot.send_message(
+                    chat_id=user_chat_id,
+                    text=header,
+                    parse_mode="HTML"
                 )
 
-                if text:
+                # Потом сам стикер
+                await bot.send_sticker(
+                    chat_id=user_chat_id,
+                    sticker=file_id
+                )
 
+                # Если был текст
+                if text:
                     await bot.send_message(
-                        user_chat_id,
-                        caption,
+                        chat_id=user_chat_id,
+                        text=(
+                            "💬 <b>Текст:</b>\n"
+                            f"{safe(text)}"
+                        ),
                         parse_mode="HTML"
                     )
 
