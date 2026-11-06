@@ -4608,24 +4608,18 @@ def build_admin_logs_text(limit=20, chat_id=None):
         title = f"📋 <b>Логи: {safe(label)}</b>"
     result = [title, "", f"Показано сообщений: {len(rows)}", ""]
 
-    grouped_rows = {}
-    for row in rows:
-        group_key = (row[1], row[2])
-        grouped_rows.setdefault(group_key, []).append(row)
-
-    for (connection_id, row_chat_id), chat_rows in grouped_rows.items():
+    # Show one global timeline. Grouping by chat here made messages from
+    # different conversations appear out of chronological order.
+    for row in sorted(rows, key=_admin_log_sort_key):
+        connection_id, row_chat_id = row[1], row[2]
         peer_name = _lookup_peer_name(connection_id, row_chat_id)
         dialog_label = "Группа" if str(connection_id).startswith("group:") else "Диалог"
         result.append(
             f"💬 <b>{dialog_label}: {safe(peer_name)}</b> · "
             f"<code>{row_chat_id}</code>"
         )
-
-        for row in sorted(chat_rows, key=_admin_log_sort_key):
-            result.append(safe(_format_admin_log_row(row)))
-            result.append("────────────────────")
-
-        result.append("")
+        result.append(safe(_format_admin_log_row(row)))
+        result.append("────────────────────")
 
     text = "\n".join(result)
     # Telegram message length cap; keep latest tail if needed.
