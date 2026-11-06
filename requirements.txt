@@ -1,3 +1,2 @@
 aiogram
 qrcode[pil]
-aiogram\nqrcode[pil]\n
