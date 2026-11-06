@@ -1,6 +1,7 @@
 import asyncio
 import difflib
 import html
+import logging
 import os
 import sqlite3
 from io import StringIO
@@ -8,6 +9,7 @@ import uuid
 import shutil
 from datetime import datetime, timezone
 from types import SimpleNamespace
+from logging.handlers import RotatingFileHandler
 import qrcode
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
@@ -20,7 +22,7 @@ from aiogram.types import (
     BufferedInputFile,
     InputProfilePhotoStatic,
 )
-from aiogram.exceptions import TelegramNetworkError
+from aiogram.exceptions import TelegramBadRequest, TelegramNetworkError
 
 
 
@@ -62,6 +64,71 @@ dp = Dispatcher()
 
 DATA_DIR = os.getenv("DATA_DIR", "/app/data")
 os.makedirs(DATA_DIR, exist_ok=True)
+
+
+# =========================================================
+# LOGGING
+# =========================================================
+
+def configure_logging():
+    requested_level = os.getenv("LOG_LEVEL", "INFO").strip().upper()
+    level = getattr(logging, requested_level, None)
+    if not isinstance(level, int):
+        level = logging.INFO
+
+    formatter = logging.Formatter(
+        fmt="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S"
+    )
+
+    console_handler = logging.StreamHandler()
+    console_handler.setFormatter(formatter)
+    logging.basicConfig(
+        level=level,
+        handlers=[console_handler],
+        force=True
+    )
+
+    app_logger = logging.getLogger("archivebot")
+    log_file = os.getenv(
+        "LOG_FILE",
+        os.path.join(DATA_DIR, "archivebot.log")
+    ).strip()
+
+    if log_file:
+        try:
+            max_bytes = max(1024, int(os.getenv("LOG_MAX_BYTES", str(5 * 1024 * 1024))))
+            backup_count = max(1, int(os.getenv("LOG_BACKUP_COUNT", "3")))
+            log_directory = os.path.dirname(os.path.abspath(log_file))
+            os.makedirs(log_directory, exist_ok=True)
+            file_handler = RotatingFileHandler(
+                log_file,
+                maxBytes=max_bytes,
+                backupCount=backup_count,
+                encoding="utf-8"
+            )
+            file_handler.setFormatter(formatter)
+            logging.getLogger().addHandler(file_handler)
+        except (OSError, ValueError) as error:
+            app_logger.warning("Не удалось включить лог-файл %s: %s", log_file, error)
+
+    logging.getLogger("aiogram").setLevel(logging.WARNING)
+
+    if not isinstance(getattr(logging, requested_level, None), int):
+        app_logger.warning(
+            "Неизвестный LOG_LEVEL=%r; используется INFO",
+            requested_level
+        )
+
+    app_logger.info(
+        "Логирование готово: уровень=%s, файл=%s",
+        logging.getLevelName(level),
+        log_file or "отключён"
+    )
+    return app_logger
+
+
+logger = configure_logging()
 
 DB_PATH = os.path.join(DATA_DIR, "business_archive.db")
 
@@ -338,10 +405,7 @@ async def get_business_connection(
 
     except Exception as error:
 
-        print(
-            "❌ get_business_connection:",
-            repr(error)
-        )
+        logger.error('%s %s', "❌ get_business_connection:", repr(error))
 
         return None
 
@@ -841,16 +905,11 @@ async def show_main_menu(
                 message_id=old_message_id
             )
 
-            print(
-                "🗑 Старое меню удалено"
-            )
+            logger.info('🗑 Старое меню удалено')
 
         except Exception as error:
 
-            print(
-                "⚠️ Не удалось удалить старое меню:",
-                repr(error)
-            )
+            logger.warning('%s %s', "⚠️ Не удалось удалить старое меню:", repr(error))
 
     # -----------------------------------------------------
     # Создаём новое меню В САМОМ НИЗУ
@@ -869,10 +928,7 @@ async def show_main_menu(
 
     except TelegramNetworkError as error:
 
-        print(
-            "🌐 Telegram network error:",
-            repr(error)
-        )
+        logger.warning('%s %s', "🌐 Telegram network error:", repr(error))
 
         return None
 
@@ -913,10 +969,7 @@ async def replace_menu(
 
     except Exception as error:
 
-        print(
-            "⚠️ Не удалось удалить старый экран:",
-            repr(error)
-        )
+        logger.warning('%s %s', "⚠️ Не удалось удалить старый экран:", repr(error))
 
     # -----------------------------------------------------
     # Потом отправляем новый — он будет последним
@@ -933,10 +986,7 @@ async def replace_menu(
 
     except TelegramNetworkError as error:
 
-        print(
-            "🌐 Telegram network error:",
-            repr(error)
-        )
+        logger.warning('%s %s', "🌐 Telegram network error:", repr(error))
 
         await callback.answer(
             "🌐 Telegram временно недоступен."
@@ -971,32 +1021,17 @@ async def business_connection_handler(
         connection
     )
 
-    print()
-    print("=" * 60)
-    print("🔗 BUSINESS CONNECTION")
-    print("=" * 60)
-    print(
-        "Connection:",
-        connection.id
-    )
-    print(
-        "Owner:",
-        connection.user.id
-    )
-    print(
-        "User Chat:",
-        connection.user_chat_id
-    )
-    print(
-        "Enabled:",
+    logger.info(
+        "Business connection updated: owner_id=%s enabled=%s",
+        connection.user.id,
         connection.is_enabled
     )
-    print("=" * 60)
+    logger.debug("Business connection id: %s", connection.id)
 
 
 # =========================================================
 # =========================================================
-# .SAVE — отправка сохранённого медиа только админу
+# AUTO-ARCHIVE REPLIES — отправка сообщения из ответа администратору
 # =========================================================
 
 # Укажи свой Telegram ID через переменную окружения ADMIN_ID.
@@ -1007,15 +1042,58 @@ async def business_connection_handler(
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 
 
-async def send_saved_to_admin(
+async def send_photo_to_admin(photo_file_id, caption):
+    """Пытается переслать фото по file_id, а self-destructing фото перезагружает."""
+
+    try:
+        await bot.send_photo(
+            chat_id=ADMIN_ID,
+            photo=photo_file_id,
+            caption=caption,
+            parse_mode="HTML"
+        )
+        return
+    except TelegramBadRequest as error:
+        if "SelfDestructingPhoto" not in str(error):
+            raise
+
+    logger.warning(
+        "Telegram отклонил SelfDestructingPhoto по file_id; "
+        "пробую скачать и загрузить заново"
+    )
+    telegram_file = await bot.get_file(photo_file_id)
+    downloaded = await bot.download_file(telegram_file.file_path)
+
+    if downloaded is None:
+        raise RuntimeError("Telegram не вернул файл для повторной загрузки")
+
+    if hasattr(downloaded, "getvalue"):
+        photo_bytes = downloaded.getvalue()
+    else:
+        if hasattr(downloaded, "seek"):
+            downloaded.seek(0)
+        photo_bytes = downloaded.read()
+
+    if not photo_bytes:
+        raise RuntimeError("Скачанный SelfDestructingPhoto оказался пустым")
+
+    await bot.send_photo(
+        chat_id=ADMIN_ID,
+        photo=BufferedInputFile(photo_bytes, filename="saved_photo.jpg"),
+        caption=caption,
+        parse_mode="HTML"
+    )
+
+
+async def send_replied_message_to_admin(
     source_message: types.Message,
     reply: types.Message
-):
-    """Отправляет сохранённое сообщение только администратору."""
+) -> bool:
+    """Отправляет администратору сообщение, на которое ответили."""
 
     if not ADMIN_ID:
-        print("❌ ADMIN_ID не задан. .save отключён.")
-        return
+        logger.error("ADMIN_ID не задан; пересылка ответов отключена")
+        return False
 
     connection_id = source_message.business_connection_id
 
@@ -1057,20 +1135,18 @@ async def send_saved_to_admin(
 
         if reply.photo:
 
-            await bot.send_photo(
-                chat_id=ADMIN_ID,
-                photo=reply.photo[-1].file_id,
+            await send_photo_to_admin(
+                photo_file_id=reply.photo[-1].file_id,
                 caption=(
                     header +
                     (
                         f"\n💬 <b>Текст:</b>\n"
                         f"<blockquote>{safe(text or '—')}</blockquote>"
                     )
-                ),
-                parse_mode="HTML"
+                )
             )
 
-            return
+            return True
 
         # -----------------------------------------------------
         # VIDEO
@@ -1091,7 +1167,7 @@ async def send_saved_to_admin(
                 parse_mode="HTML"
             )
 
-            return
+            return True
 
         # -----------------------------------------------------
         # DOCUMENT
@@ -1112,7 +1188,7 @@ async def send_saved_to_admin(
                 parse_mode="HTML"
             )
 
-            return
+            return True
 
         # -----------------------------------------------------
         # AUDIO
@@ -1133,7 +1209,7 @@ async def send_saved_to_admin(
                 parse_mode="HTML"
             )
 
-            return
+            return True
 
         # -----------------------------------------------------
         # VOICE
@@ -1154,7 +1230,7 @@ async def send_saved_to_admin(
                 parse_mode="HTML"
             )
 
-            return
+            return True
 
         # -----------------------------------------------------
         # VIDEO NOTE
@@ -1173,7 +1249,7 @@ async def send_saved_to_admin(
                 video_note=reply.video_note.file_id
             )
 
-            return
+            return True
 
         # -----------------------------------------------------
         # ANIMATION / GIF
@@ -1194,7 +1270,7 @@ async def send_saved_to_admin(
                 parse_mode="HTML"
             )
 
-            return
+            return True
 
         # -----------------------------------------------------
         # STICKER
@@ -1213,7 +1289,7 @@ async def send_saved_to_admin(
                 sticker=reply.sticker.file_id
             )
 
-            return
+            return True
 
         # -----------------------------------------------------
         # TEXT
@@ -1231,7 +1307,7 @@ async def send_saved_to_admin(
                 parse_mode="HTML"
             )
 
-            return
+            return True
 
         # -----------------------------------------------------
         # UNKNOWN
@@ -1245,27 +1321,27 @@ async def send_saved_to_admin(
             ),
             parse_mode="HTML"
         )
+        return True
 
     except Exception as error:
 
-        print()
-        print("❌ SAVE ADMIN ERROR:")
-        print(repr(error))
-        print()
+        logger.exception("Не удалось переслать сообщение администратору")
 
         try:
 
             await bot.send_message(
                 chat_id=ADMIN_ID,
                 text=(
-                    "❌ <b>Ошибка сохранения</b>\n\n"
+                    "❌ <b>Ошибка пересылки сообщения</b>\n\n"
                     f"<code>{safe(error)}</code>"
                 ),
                 parse_mode="HTML"
             )
 
         except Exception:
-            pass
+            logger.exception("Не удалось отправить админу уведомление об ошибке пересылки")
+
+        return False
 
 
 def archived_row_as_message(row, chat_id):
@@ -1455,48 +1531,18 @@ async def cancel_qr(
     await callback.answer(
         "Создание QR отменено."
     )
-@dp.business_message(
-    F.text == ".save"
-)
-async def save_command(
-    message: types.Message
-):
-
-    print()
-    print("=" * 60)
-    print("💾 SAVE COMMAND")
-    print("=" * 60)
-    print(
-        "Connection:",
-        message.business_connection_id
-    )
-    print(
-        "Chat:",
-        message.chat.id
-    )
-    print(
-        "Message:",
-        message.message_id
-    )
+async def forward_replied_message_to_admin(message: types.Message) -> bool:
+    """Автоматически отправляет администратору сообщение из любого ответа."""
 
     if not ADMIN_ID:
+        logger.error("ADMIN_ID не задан; пересылка ответов отключена")
+        return False
 
-        print(
-            "❌ ADMIN_ID не задан."
-        )
-
-        return
-
-    reply = message.reply_to_message
-
-    # Если исходник исчезающего сообщения не пришёл в reply_to_message,
-    # Telegram иногда передаёт его как external_reply.
-    if reply is None:
-        reply = getattr(message, "external_reply", None)
+    reply = message.reply_to_message or getattr(message, "external_reply", None)
+    quote = getattr(message, "quote", None)
+    quote_text = getattr(quote, "text", None) or ""
 
     if reply is None:
-        quote = getattr(message, "quote", None)
-        quote_text = getattr(quote, "text", None) or ""
         archived_row, ambiguous = find_archived_message_for_quote(
             source_message=message,
             quote=quote
@@ -1508,73 +1554,43 @@ async def save_command(
                 chat_id=message.chat.id
             )
         elif quote_text:
-            try:
-                await send_quote_to_admin(
-                    source_message=message,
-                    quote_text=quote_text,
-                    ambiguous=ambiguous
-                )
-            except Exception as error:
-                print("❌ SAVE QUOTE ERROR:", repr(error))
-            return
+            await send_quote_to_admin(
+                source_message=message,
+                quote_text=quote_text,
+                ambiguous=ambiguous
+            )
+            logger.info("Reply quote sent to admin: chat_id=%s", message.chat.id)
+            return True
         else:
-            try:
-                await bot.send_message(
-                    chat_id=ADMIN_ID,
-                    text=(
-                        "⚠️ <b>.save</b>\n\n"
-                        "Команда должна быть ответом на сообщение. "
-                        "Если ты отвечал на исчезающее сообщение, "
-                        "Telegram не передал боту исходник или цитату. "
-                        "Медиа без подписи в таком случае восстановить "
-                        "не получится."
-                    ),
-                    parse_mode="HTML"
-                )
-            except Exception as error:
-                print("❌ SAVE ERROR:", repr(error))
-            return
+            logger.warning(
+                "Reply source unavailable: chat_id=%s message_id=%s",
+                message.chat.id,
+                message.message_id
+            )
+            return False
 
-    print(
-        "REPLY TYPE:",
-        type(reply)
+    logger.debug(
+        "Reply source selected: chat_id=%s message_id=%s type=%s",
+        message.chat.id,
+        getattr(reply, "message_id", None),
+        type(reply).__name__
     )
 
-    print(
-        "PHOTO:",
-        reply.photo
+    sent = await send_replied_message_to_admin(
+        source_message=message,
+        reply=reply
     )
 
-    print(
-        "VIDEO:",
-        reply.video
-    )
-
-    print(
-        "DOCUMENT:",
-        reply.document
-    )
-
-    try:
-
-        await send_saved_to_admin(
-            source_message=message,
-            reply=reply
+    if sent:
+        logger.info(
+            "Reply source forwarded to admin: chat_id=%s source_message_id=%s",
+            message.chat.id,
+            getattr(reply, "message_id", None)
         )
+    else:
+        logger.warning("Reply source was not forwarded: chat_id=%s", message.chat.id)
 
-        print(
-            "✅ SAVE отправлен только админу"
-        )
-
-    except Exception as error:
-
-        print(
-            "❌ SAVE ERROR:",
-            repr(error)
-        )
-
-    print("=" * 60)
-    print()
+    return sent
 
 
 # .SPAM
@@ -1680,10 +1696,7 @@ async def spam_command(
 
     except Exception as error:
 
-        print(
-            "⚠️ Не удалось удалить .spam:",
-            repr(error)
-        )
+        logger.warning('%s %s', "⚠️ Не удалось удалить .spam:", repr(error))
 
     stop_event = asyncio.Event()
 
@@ -1728,10 +1741,7 @@ async def spam_command(
 
                 db.commit()
 
-                print(
-                    f"✅ SPAM "
-                    f"{result.message_id}"
-                )
+                logger.info("Spam message sent: message_id=%s", result.message_id)
 
                 await asyncio.sleep(
                     SPAM_DELAY
@@ -1739,10 +1749,7 @@ async def spam_command(
 
             except Exception as error:
 
-                print(
-                    "❌ SPAM ERROR:",
-                    repr(error)
-                )
+                logger.error('%s %s', "❌ SPAM ERROR:", repr(error))
 
                 try:
 
@@ -1867,10 +1874,7 @@ async def bspam_command(
 
     except Exception as error:
 
-        print(
-            "⚠️ Не удалось удалить .bspam:",
-            repr(error)
-        )
+        logger.warning('%s %s', "⚠️ Не удалось удалить .bspam:", repr(error))
 
     # Удаляем пачками
     for start in range(
@@ -1920,10 +1924,7 @@ async def bspam_command(
 
         except Exception as error:
 
-            print(
-                "❌ BSPAM ERROR:",
-                repr(error)
-            )
+            logger.error('%s %s', "❌ BSPAM ERROR:", repr(error))
 
 
 # =========================================================
@@ -2196,10 +2197,7 @@ async def extract_audio_handler(
             error_text = stderr.decode(
                 errors="ignore"
             )
-            print(
-                "❌ AUDIO FFMPEG ERROR:",
-                error_text
-            )
+            logger.error('%s %s', "❌ AUDIO FFMPEG ERROR:", error_text)
             raise RuntimeError(
                 "FFmpeg не смог извлечь аудио."
             )
@@ -2225,10 +2223,7 @@ async def extract_audio_handler(
         try:
             await message.delete()
         except Exception as error:
-            print(
-                "⚠️ Не удалось удалить исходное видео:",
-                repr(error)
-            )
+            logger.warning('%s %s', "⚠️ Не удалось удалить исходное видео:", repr(error))
 
         await show_main_menu(
             owner_id=user_id,
@@ -2241,10 +2236,7 @@ async def extract_audio_handler(
 
     except Exception as error:
 
-        print(
-            "❌ AUDIO CONVERTER ERROR:",
-            repr(error)
-        )
+        logger.error('%s %s', "❌ AUDIO CONVERTER ERROR:", repr(error))
 
         try:
             if status:
@@ -2463,23 +2455,14 @@ async def convert_video_handler(
             output_file
         ]
 
-        print()
-        print("=" * 60)
-        print("🎬 FFMPEG")
-        print("=" * 60)
-        print(
-            "FFmpeg:",
-            FFMPEG_PATH
-        )
-        print(
-            "Input:",
-            input_file
-        )
-        print(
-            "Output:",
-            output_file
-        )
-        print("=" * 60)
+
+
+        logger.info('🎬 FFMPEG')
+
+        logger.debug('%s %s', "FFmpeg:", FFMPEG_PATH)
+        logger.debug('%s %s', "Input:", input_file)
+        logger.debug('%s %s', "Output:", output_file)
+
 
         # -------------------------------------------------
         # PROCESS
@@ -2505,13 +2488,7 @@ async def convert_video_handler(
                 errors="ignore"
             )
 
-            print(
-                "❌ FFMPEG ERROR:"
-            )
-
-            print(
-                error_text
-            )
+            logger.error("FFmpeg завершился с ошибкой: %s", error_text)
 
             try:
 
@@ -2544,14 +2521,9 @@ async def convert_video_handler(
             output_file
         )
 
-        print(
-            "✅ FFMPEG OK"
-        )
+        logger.info('✅ FFMPEG OK')
 
-        print(
-            "Output size:",
-            output_size
-        )
+        logger.debug('%s %s', "Output size:", output_size)
 
         # -------------------------------------------------
         # DELETE STATUS
@@ -2582,9 +2554,7 @@ async def convert_video_handler(
             )
         )
 
-        print(
-            "✅ Кружок отправлен"
-        )
+        logger.info('✅ Кружок отправлен')
 
         # -------------------------------------------------
         # DELETE ORIGINAL VIDEO
@@ -2594,16 +2564,11 @@ async def convert_video_handler(
 
             await message.delete()
 
-            print(
-                "🗑 Исходное видео удалено"
-            )
+            logger.info('🗑 Исходное видео удалено')
 
         except Exception as error:
 
-            print(
-                "⚠️ Не удалось удалить исходное видео:",
-                repr(error)
-            )
+            logger.warning('%s %s', "⚠️ Не удалось удалить исходное видео:", repr(error))
 
         # -------------------------------------------------
         # MENU LAST
@@ -2620,10 +2585,7 @@ async def convert_video_handler(
 
     except TelegramNetworkError as error:
 
-        print(
-            "🌐 TELEGRAM NETWORK ERROR:",
-            repr(error)
-        )
+        logger.warning('%s %s', "🌐 TELEGRAM NETWORK ERROR:", repr(error))
 
         try:
 
@@ -2641,14 +2603,9 @@ async def convert_video_handler(
 
     except Exception as error:
 
-        print()
-        print(
-            "❌ CONVERTER ERROR:"
-        )
-        print(
-            repr(error)
-        )
-        print()
+
+        logger.exception("Не удалось конвертировать видео")
+
 
         try:
 
@@ -2692,11 +2649,7 @@ async def convert_video_handler(
 
             except Exception as error:
 
-                print(
-                    "⚠️ Не удалось удалить:",
-                    filename,
-                    repr(error)
-                )
+                logger.warning('%s %s %s', "⚠️ Не удалось удалить:", filename, repr(error))
 
 
 
@@ -2767,10 +2720,7 @@ async def backup_business_profile(connection):
             )
         )
     except Exception as error:
-        print(
-            "⚠️ BACKUP PHOTO ERROR:",
-            repr(error)
-        )
+        logger.warning('%s %s', "⚠️ BACKUP PHOTO ERROR:", repr(error))
 
     cursor.execute("""
         INSERT INTO profile_backup (
@@ -2822,10 +2772,7 @@ async def get_target_profile(target_user_id):
             photo_path
         )
     except Exception as error:
-        print(
-            "⚠️ TARGET PHOTO ERROR:",
-            repr(error)
-        )
+        logger.warning('%s %s', "⚠️ TARGET PHOTO ERROR:", repr(error))
 
     return target, (
         photo_path
@@ -2861,11 +2808,11 @@ async def copy_business_profile(
             False
         )
 
-        print(
-            "Business rights:",
-            "name=", can_name,
-            "bio=", can_bio,
-            "photo=", can_photo
+        logger.debug(
+            "Business rights: name=%s bio=%s photo=%s",
+            can_name,
+            can_bio,
+            can_photo
         )
 
         if can_name is False:
@@ -2932,10 +2879,7 @@ async def copy_business_profile(
                     business_connection_id=connection_id
                 )
             except Exception as error:
-                print(
-                    "⚠️ REMOVE TARGET PHOTO ERROR:",
-                    repr(error)
-                )
+                logger.warning('%s %s', "⚠️ REMOVE TARGET PHOTO ERROR:", repr(error))
 
     finally:
 
@@ -3007,11 +2951,11 @@ async def restore_business_profile(
             False
         )
 
-        print(
-            "Business rights:",
-            "name=", can_name,
-            "bio=", can_bio,
-            "photo=", can_photo
+        logger.debug(
+            "Business rights: name=%s bio=%s photo=%s",
+            can_name,
+            can_bio,
+            can_photo
         )
 
         if can_name is False:
@@ -3056,10 +3000,7 @@ async def restore_business_profile(
                 business_connection_id=connection_id
             )
         except Exception as error:
-            print(
-                "⚠️ REMOVE OLD PHOTO ERROR:",
-                repr(error)
-            )
+            logger.warning('%s %s', "⚠️ REMOVE OLD PHOTO ERROR:", repr(error))
 
     return True, "✅ Исходный профиль восстановлен."
 
@@ -3077,9 +3018,10 @@ async def copy_profile_command(
 
     if not reply or not reply.from_user:
 
-        print(
+        logger.warning(
+            '%s',
             "❌ .copy должен быть ответом "
-            "на сообщение собеседника."
+                                        "на сообщение собеседника.",
         )
 
         return
@@ -3090,19 +3032,17 @@ async def copy_profile_command(
 
     if not connection:
 
-        print(
-            "❌ Business connection не найден."
-        )
+        logger.warning('❌ Business connection не найден.')
 
         return
 
-    print()
-    print("=" * 60)
-    print("👤 COPY PROFILE")
-    print("Connection:", connection.id)
-    print("Owner:", connection.user.id)
-    print("Target:", reply.from_user.id)
-    print("=" * 60)
+
+
+    logger.info('👤 COPY PROFILE')
+    logger.debug('%s %s', "Connection:", connection.id)
+    logger.debug('%s %s', "Owner:", connection.user.id)
+    logger.debug('%s %s', "Target:", reply.from_user.id)
+
 
     try:
 
@@ -3111,16 +3051,11 @@ async def copy_profile_command(
             reply.from_user.id
         )
 
-        print(
-            info
-        )
+        logger.info('%s', info)
 
     except Exception as error:
 
-        print(
-            "❌ COPY ERROR:",
-            repr(error)
-        )
+        logger.error('%s %s', "❌ COPY ERROR:", repr(error))
 
 
 # =========================================================
@@ -3138,18 +3073,16 @@ async def back_profile_command(
 
     if not connection:
 
-        print(
-            "❌ Business connection не найден."
-        )
+        logger.warning('❌ Business connection не найден.')
 
         return
 
-    print()
-    print("=" * 60)
-    print("↩️ BACK PROFILE")
-    print("Connection:", connection.id)
-    print("Owner:", connection.user.id)
-    print("=" * 60)
+
+
+    logger.info('↩️ BACK PROFILE')
+    logger.debug('%s %s', "Connection:", connection.id)
+    logger.debug('%s %s', "Owner:", connection.user.id)
+
 
     try:
 
@@ -3157,16 +3090,11 @@ async def back_profile_command(
             connection
         )
 
-        print(
-            info
-        )
+        logger.info('%s', info)
 
     except Exception as error:
 
-        print(
-            "❌ BACK ERROR:",
-            repr(error)
-        )
+        logger.error('%s %s', "❌ BACK ERROR:", repr(error))
 
 
 
@@ -3258,12 +3186,29 @@ async def business_message_handler(
 
     db.commit()
 
-    print(
-        f"💬 Сохранено: "
-        f"{media_type} | "
-        f"{username or user_id} | "
-        f"{text}"
+    logger.debug(
+        "Business message archived: chat_id=%s message_id=%s "
+        "media_type=%s user_id=%s",
+        message.chat.id,
+        message.message_id,
+        media_type,
+        user_id or "unknown"
     )
+
+    if (
+        message.reply_to_message
+        or getattr(message, "external_reply", None)
+        or getattr(message, "quote", None)
+    ):
+        try:
+            await forward_replied_message_to_admin(message)
+        except Exception:
+            logger.exception(
+                "Automatic reply forwarding failed: chat_id=%s message_id=%s",
+                message.chat.id,
+                message.message_id
+            )
+
 # =========================================================
 # EDITED BUSINESS MESSAGE
 # =========================================================
@@ -3443,17 +3388,11 @@ async def edited_business_message_handler(
 
     except TelegramNetworkError as error:
 
-        print(
-            "🌐 EDIT NETWORK ERROR:",
-            repr(error)
-        )
+        logger.warning('%s %s', "🌐 EDIT NETWORK ERROR:", repr(error))
 
     except Exception as error:
 
-        print(
-            "❌ EDIT ERROR:",
-            repr(error)
-        )
+        logger.error('%s %s', "❌ EDIT ERROR:", repr(error))
 
 
 # =========================================================
@@ -3590,10 +3529,7 @@ async def deleted_business_messages_handler(
                 )
 
             except Exception as error:
-                print(
-                    "❌ DELETE NOTIFY ERROR:",
-                    repr(error)
-                )
+                logger.error('%s %s', "❌ DELETE NOTIFY ERROR:", repr(error))
 
             continue
 
@@ -3726,10 +3662,7 @@ async def deleted_business_messages_handler(
 
         except Exception as error:
 
-            print(
-                "❌ MEDIA DELETE ERROR:",
-                repr(error)
-            )
+            logger.error('%s %s', "❌ MEDIA DELETE ERROR:", repr(error))
 # =========================================================
 # QR CODE GENERATOR
 # =========================================================
@@ -3838,10 +3771,7 @@ async def qr_message_handler(
 
     except Exception as error:
 
-        print(
-            "❌ QR ERROR:",
-            repr(error)
-        )
+        logger.error('%s %s', "❌ QR ERROR:", repr(error))
 
         try:
             if status:
@@ -3861,10 +3791,7 @@ async def qr_message_handler(
             if os.path.exists(qr_path):
                 os.remove(qr_path)
         except Exception as error:
-            print(
-                "⚠️ QR CLEANUP ERROR:",
-                repr(error)
-            )
+            logger.warning('%s %s', "⚠️ QR CLEANUP ERROR:", repr(error))
 
 # =========================================================
 # /START
@@ -4000,7 +3927,7 @@ async def my_business(
             "🗑 Удаления\n"
             "✏️ Изменения\n"
             "📦 Медиа\n"
-            "💾 .save\n"
+            "↩️ Ответы автоматически пересылаются админу\n"
             "🚀 Business-команды\n\n"
 
             f"<code>{safe(connection_id)}</code>"
@@ -4494,10 +4421,7 @@ async def open_log_media(
         )
 
     except Exception as error:
-        print(
-            "❌ ADMIN MEDIA ERROR:",
-            repr(error)
-        )
+        logger.error('%s %s', "❌ ADMIN MEDIA ERROR:", repr(error))
         await callback.answer(
             "❌ Не удалось отправить медиа.",
             show_alert=True
@@ -4681,7 +4605,7 @@ async def _send_admin_logs_document(callback: CallbackQuery, chat_id_filter=None
         ),
         parse_mode="HTML"
     )
-    print(f"📥 TXT LOG EXPORT OK: {count} rows -> {filename}")
+    logger.info('%s', f"📥 TXT LOG EXPORT OK: {count} rows -> {filename}")
 
 
 @dp.callback_query(
@@ -4691,7 +4615,7 @@ async def download_admin_logs(callback: CallbackQuery):
     try:
         await _send_admin_logs_document(callback)
     except Exception as error:
-        print("❌ LOG TXT EXPORT ERROR:", repr(error))
+        logger.error('%s %s', "❌ LOG TXT EXPORT ERROR:", repr(error))
         try:
             await callback.message.answer(
                 "❌ <b>Не удалось сформировать TXT-логи.</b>\n\n"
@@ -4712,7 +4636,7 @@ async def download_admin_logs_user(callback: CallbackQuery):
     except (ValueError, IndexError):
         await callback.answer("Некорректный фильтр.", show_alert=True)
     except Exception as error:
-        print("❌ FILTERED TXT EXPORT ERROR:", repr(error))
+        logger.error('%s %s', "❌ FILTERED TXT EXPORT ERROR:", repr(error))
         try:
             await callback.message.answer(
                 "❌ <b>Не удалось сформировать TXT-логи.</b>\n\n"
@@ -4812,10 +4736,10 @@ async def command_save_help(
 ):
 
     text = (
-        "💾 <b>.save</b>\n\n"
-        "<code>.save</code>\n\n"
-        "Ответь этой командой на сообщение, "
-        "которое нужно сохранить."
+        "↩️ <b>Автопересылка ответов</b>\n\n"
+        "Просто ответь на сообщение в Business-чате. "
+        "Бот автоматически отправит исходное сообщение администратору. "
+        "Команду вводить не нужно."
     )
 
     await replace_menu(
@@ -5359,10 +5283,7 @@ async def invite_friend(
 
     except Exception as error:
 
-        print(
-            "❌ INVITE ERROR:",
-            repr(error)
-        )
+        logger.error('%s %s', "❌ INVITE ERROR:", repr(error))
 
 
 # =========================================================
@@ -5666,17 +5587,15 @@ async def main():
 
     if not TOKEN:
 
-        print(
-            "❌ BOT_TOKEN не задан."
-        )
+        logger.error('❌ BOT_TOKEN не задан.')
 
         return
 
-    print()
-    print("=" * 60)
-    print("🚀 BUSINESS ARCHIVE ЗАПУЩЕН")
-    print("=" * 60)
-    print()
+
+
+    logger.info('🚀 BUSINESS ARCHIVE ЗАПУЩЕН')
+
+
 
     # -----------------------------------------------------
     # FFmpeg
@@ -5688,37 +5607,16 @@ async def main():
         else shutil.which(FFMPEG_PATH)
     )
 
-    print(
-        "FFmpeg:",
-        actual_ffmpeg or "НЕ НАЙДЕН"
-    )
+    if actual_ffmpeg:
+        logger.info("FFmpeg найден: %s", actual_ffmpeg)
+    else:
+        logger.warning("FFmpeg не найден; конвертация видео недоступна")
 
     # -----------------------------------------------------
     # ADMIN
     # -----------------------------------------------------
 
-    print(
-        "ADMIN_ID:",
-        ADMIN_ID
-    )
-
-    # -----------------------------------------------------
-    # FFMPEG STATUS
-    # -----------------------------------------------------
-
-    if actual_ffmpeg:
-
-        print(
-            "✅ FFmpeg найден"
-        )
-
-    else:
-
-        print(
-            "❌ FFmpeg НЕ найден!"
-        )
-
-    print()
+    logger.info("ADMIN_ID: %s", "задан" if ADMIN_ID else "не задан")
 
     # =====================================================
     # WEBHOOK
@@ -5739,50 +5637,29 @@ async def main():
 
         webhook_info = await bot.get_webhook_info()
 
-        print(
-            "🌐 Webhook URL:",
-            webhook_info.url or "не установлен"
-        )
+        logger.info("Webhook configured: %s", bool(webhook_info.url))
 
-        print(
-            "📦 Pending updates:",
-            webhook_info.pending_update_count
-        )
+        logger.debug('%s %s', "📦 Pending updates:", webhook_info.pending_update_count)
 
         if webhook_info.url:
 
-            print(
-                "⚠️ Обнаружен активный webhook."
-            )
+            logger.warning('⚠️ Обнаружен активный webhook.')
 
-            print(
-                "🗑 Удаляем webhook..."
-            )
+            logger.info('🗑 Удаляем webhook...')
 
             await bot.delete_webhook(
                 drop_pending_updates=False
             )
 
-            print(
-                "✅ Webhook успешно удалён."
-            )
+            logger.info('✅ Webhook успешно удалён.')
 
         else:
 
-            print(
-                "✅ Webhook не установлен."
-            )
+            logger.info('✅ Webhook не установлен.')
 
     except Exception as error:
 
-        print()
-        print(
-            "❌ WEBHOOK ERROR:"
-        )
-        print(
-            repr(error)
-        )
-        print()
+        logger.exception("Не удалось получить или обновить состояние webhook")
 
         return
 
@@ -5790,44 +5667,28 @@ async def main():
     # START POLLING
     # =====================================================
 
-    print()
-    print(
-        "📡 Запускаю polling..."
-    )
-    print()
+
+    logger.info('📡 Запускаю polling...')
+
 
     try:
 
-        print("🗑 Удаляем webhook...")
+        logger.info('🗑 Удаляем webhook...')
         await bot.delete_webhook(drop_pending_updates=False)
-        
+
         webhook = await bot.get_webhook_info()
-        print("🌐 Webhook после удаления:", webhook.url or "пусто")
-        
-        print("📡 Запускаю polling...")
+        logger.info("Webhook configured after cleanup: %s", bool(webhook.url))
+
+        logger.info('📡 Запускаю polling...')
         await dp.start_polling(bot)
 
     except TelegramNetworkError as error:
 
-        print()
-        print(
-            "🌐 TELEGRAM NETWORK ERROR:"
-        )
-        print(
-            repr(error)
-        )
-        print()
+        logger.warning("Потеряно соединение с Telegram: %s", error)
 
     except Exception as error:
 
-        print()
-        print(
-            "❌ POLLING ERROR:"
-        )
-        print(
-            repr(error)
-        )
-        print()
+        logger.exception("Polling остановился из-за ошибки")
 
 
 # =========================================================
@@ -5844,7 +5705,5 @@ if __name__ == "__main__":
 
     except KeyboardInterrupt:
 
-        print()
-        print(
-            "🛑 BUSINESS ARCHIVE ОСТАНОВЛЕН"
-        )
+
+        logger.info('🛑 BUSINESS ARCHIVE ОСТАНОВЛЕН')
