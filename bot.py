@@ -1694,7 +1694,25 @@ def is_ephemeral_message(message) -> bool:
     if not message:
         return False
 
-    if getattr(message, "ttl_period", None):
+    def has_ttl_or_ephemeral_marker(value, depth=0):
+        if value is None or depth > 4:
+            return False
+        type_name = type(value).__name__.lower()
+        if "selfdestruct" in type_name or "ephemeral" in type_name:
+            return True
+        if isinstance(value, dict):
+            data = value
+        else:
+            data = getattr(value, "model_extra", None) or {}
+        for key, item in data.items():
+            normalized_key = str(key).lower()
+            if normalized_key in ("ttl_period", "ttl_seconds") and item:
+                return True
+            if has_ttl_or_ephemeral_marker(item, depth + 1):
+                return True
+        return False
+
+    if has_ttl_or_ephemeral_marker(message):
         return True
 
     for field in ("photo", "video", "document", "audio", "voice"):
@@ -1703,10 +1721,7 @@ def is_ephemeral_message(message) -> bool:
         for item in items:
             if item is None:
                 continue
-            if getattr(item, "ttl_seconds", None):
-                return True
-            type_name = type(item).__name__.lower()
-            if "selfdestruct" in type_name or "ephemeral" in type_name:
+            if has_ttl_or_ephemeral_marker(item):
                 return True
 
     type_name = type(message).__name__.lower()
