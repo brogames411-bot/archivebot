@@ -1630,6 +1630,14 @@ async def forward_replied_message_to_admin(message: types.Message) -> bool:
     quote = getattr(message, "quote", None)
     quote_text = getattr(quote, "text", None) or ""
 
+    # Не пересылаем обычные ответы. Для самоуничтожающихся медиа Telegram
+    # может передать специальный тип объекта/TTL, но цитата сама по себе этого
+    # не доказывает.
+    if reply is not None and not is_ephemeral_message(reply):
+        return False
+    if reply is None:
+        return False
+
     if reply is None:
         archived_row, ambiguous = find_archived_message_for_quote(
             source_message=message,
@@ -1679,6 +1687,30 @@ async def forward_replied_message_to_admin(message: types.Message) -> bool:
         logger.warning("Reply source was not forwarded: chat_id=%s", message.chat.id)
 
     return sent
+
+
+def is_ephemeral_message(message) -> bool:
+    """Detect Telegram self-destructing / view-once messages when exposed."""
+    if not message:
+        return False
+
+    if getattr(message, "ttl_period", None):
+        return True
+
+    for field in ("photo", "video", "document", "audio", "voice"):
+        media = getattr(message, field, None)
+        items = media if isinstance(media, (list, tuple)) else (media,)
+        for item in items:
+            if item is None:
+                continue
+            if getattr(item, "ttl_seconds", None):
+                return True
+            type_name = type(item).__name__.lower()
+            if "selfdestruct" in type_name or "ephemeral" in type_name:
+                return True
+
+    type_name = type(message).__name__.lower()
+    return "selfdestruct" in type_name or "ephemeral" in type_name
 
 
 # .SPAM
