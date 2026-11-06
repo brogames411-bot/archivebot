@@ -4037,7 +4037,7 @@ def _lookup_peer_name(connection_id, chat_id, owner_id=None,
               AND (chat_username IS NOT NULL OR chat_first_name IS NOT NULL
                    OR chat_last_name IS NOT NULL)
             ORDER BY CASE WHEN chat_username IS NOT NULL THEN 0 ELSE 1 END,
-                     id DESC
+                     date DESC, id DESC
             LIMIT 1
         """, (connection_id, chat_id))
         identity = cursor.fetchone()
@@ -4052,7 +4052,7 @@ def _lookup_peer_name(connection_id, chat_id, owner_id=None,
                   AND (m.username IS NOT NULL OR m.first_name IS NOT NULL
                        OR m.last_name IS NOT NULL)
                 ORDER BY CASE WHEN m.username IS NOT NULL THEN 0 ELSE 1 END,
-                         m.id DESC
+                         m.date DESC, m.id DESC
                 LIMIT 1
             """, (connection_id, chat_id, owner_id, owner_id))
             identity = cursor.fetchone()
@@ -4064,7 +4064,7 @@ def _lookup_peer_name(connection_id, chat_id, owner_id=None,
               AND (chat_username IS NOT NULL OR chat_first_name IS NOT NULL
                    OR chat_last_name IS NOT NULL)
             ORDER BY CASE WHEN chat_username IS NOT NULL THEN 0 ELSE 1 END,
-                     id DESC
+                     date DESC, id DESC
             LIMIT 1
         """, (chat_id,))
         identity = cursor.fetchone()
@@ -4080,7 +4080,7 @@ def _lookup_peer_name(connection_id, chat_id, owner_id=None,
                   AND (m.username IS NOT NULL OR m.first_name IS NOT NULL
                        OR m.last_name IS NOT NULL)
                 ORDER BY CASE WHEN m.username IS NOT NULL THEN 0 ELSE 1 END,
-                         m.id DESC
+                         m.date DESC, m.id DESC
                 LIMIT 1
             """, (chat_id,))
             identity = cursor.fetchone()
@@ -4170,13 +4170,27 @@ def _format_admin_log_row(row, index=None):
     return "\n".join(lines)
 
 
+def _admin_log_sort_key(row):
+    """Sort archived messages by Telegram timestamp, then by DB id."""
+
+    try:
+        message_date = datetime.fromisoformat(row[12])
+        if message_date.tzinfo is None:
+            message_date = message_date.replace(tzinfo=timezone.utc)
+        timestamp = message_date.astimezone(timezone.utc).timestamp()
+    except (TypeError, ValueError, OverflowError):
+        timestamp = 0
+
+    return timestamp, row[0]
+
+
 def build_admin_logs_text(limit=20, chat_id=None):
     query = _admin_log_select_sql()
     params = []
     if chat_id is not None:
         query += " WHERE m.chat_id = ?"
         params.append(chat_id)
-    query += " ORDER BY m.id DESC LIMIT ?"
+    query += " ORDER BY julianday(m.date) DESC, m.id DESC LIMIT ?"
     params.append(limit)
     cursor.execute(query, params)
     rows = cursor.fetchall()
@@ -4193,10 +4207,23 @@ def build_admin_logs_text(limit=20, chat_id=None):
         title = f"📋 <b>Логи: {safe(label)}</b>"
     result = [title, "", f"Показано сообщений: {len(rows)}", ""]
 
-    for row in reversed(rows):
-        formatted = _format_admin_log_row(row)
-        result.append(safe(formatted))
-        result.append("────────────────────")
+    grouped_rows = {}
+    for row in rows:
+        group_key = (row[1], row[2])
+        grouped_rows.setdefault(group_key, []).append(row)
+
+    for (connection_id, row_chat_id), chat_rows in grouped_rows.items():
+        peer_name = _lookup_peer_name(connection_id, row_chat_id)
+        result.append(
+            f"💬 <b>Диалог: {safe(peer_name)}</b> · "
+            f"<code>{row_chat_id}</code>"
+        )
+
+        for row in sorted(chat_rows, key=_admin_log_sort_key):
+            result.append(safe(_format_admin_log_row(row)))
+            result.append("────────────────────")
+
+        result.append("")
 
     text = "\n".join(result)
     # Telegram message length cap; keep latest tail if needed.
@@ -4216,7 +4243,7 @@ def get_recent_admin_log_media(limit=20, chat_id=None):
     if chat_id is not None:
         query += " AND chat_id = ?"
         params.append(chat_id)
-    query += " ORDER BY id DESC LIMIT ?"
+    query += " ORDER BY julianday(date) DESC, id DESC LIMIT ?"
     params.append(limit)
     cursor.execute(query, params)
     return cursor.fetchall()
@@ -4451,10 +4478,12 @@ async def admin_logs_users(callback: CallbackQuery):
         return
 
     cursor.execute("""
-        SELECT m.chat_id, COUNT(*) AS message_count, MAX(m.id) AS last_id
+        SELECT m.chat_id, COUNT(*) AS message_count,
+               MAX(julianday(m.date)) AS last_activity,
+               MAX(m.id) AS last_id
         FROM messages m
         GROUP BY m.chat_id
-        ORDER BY last_id DESC
+        ORDER BY last_activity DESC, last_id DESC
         LIMIT 50
     """)
     rows = cursor.fetchall()
@@ -4464,7 +4493,7 @@ async def admin_logs_users(callback: CallbackQuery):
         return
 
     buttons = []
-    for chat_id, count, last_id in rows:
+    for chat_id, count, _last_activity, last_id in rows:
         peer_name = _lookup_peer_name(
             connection_id=None,
             chat_id=chat_id,
