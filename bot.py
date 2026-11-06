@@ -7,6 +7,7 @@ from io import StringIO
 import uuid
 import shutil
 from datetime import datetime, timezone
+from types import SimpleNamespace
 import qrcode
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
@@ -1018,32 +1019,35 @@ async def send_saved_to_admin(
 
     connection_id = source_message.business_connection_id
 
-    sender_id = (
-        reply.from_user.id
-        if reply.from_user
-        else "неизвестно"
-    )
+    sender = getattr(reply, "from_user", None)
+    if sender is None:
+        origin = getattr(reply, "origin", None)
+        sender = getattr(origin, "sender_user", None)
 
+    sender_id = getattr(sender, "id", None) or "неизвестно"
     sender_name = (
         get_user_name(
-            reply.from_user.first_name,
-            reply.from_user.last_name,
-            reply.from_user.username
+            getattr(sender, "first_name", None),
+            getattr(sender, "last_name", None),
+            getattr(sender, "username", None)
         )[0]
-        if reply.from_user
+        if sender
         else "Неизвестный пользователь"
     )
+    reply_chat = getattr(reply, "chat", None)
+    reply_chat_id = getattr(reply_chat, "id", None) or source_message.chat.id
+    reply_message_id = getattr(reply, "message_id", None) or "неизвестно"
 
     header = (
         "💾 <b>СОХРАНЁННОЕ СООБЩЕНИЕ</b>\n\n"
         f"👤 <b>Отправитель:</b> {safe(sender_name)}\n"
         f"🆔 <b>User ID:</b> <code>{sender_id}</code>\n"
-        f"💬 <b>Chat ID:</b> <code>{reply.chat.id}</code>\n"
-        f"📨 <b>Message ID:</b> <code>{reply.message_id}</code>\n"
+        f"💬 <b>Chat ID:</b> <code>{reply_chat_id}</code>\n"
+        f"📨 <b>Message ID:</b> <code>{reply_message_id}</code>\n"
         f"🔗 <b>Connection:</b> <code>{safe(connection_id)}</code>\n"
     )
 
-    text = reply.text or reply.caption or ""
+    text = getattr(reply, "text", None) or getattr(reply, "caption", None) or ""
 
     try:
 
@@ -1263,6 +1267,135 @@ async def send_saved_to_admin(
         except Exception:
             pass
 
+
+def archived_row_as_message(row, chat_id):
+    """Преобразует запись архива в объект с полями Telegram Message."""
+
+    (
+        message_id,
+        user_id,
+        username,
+        first_name,
+        last_name,
+        text,
+        media_type,
+        file_id
+    ) = row
+
+    sender = None
+    if user_id is not None or username or first_name or last_name:
+        sender = SimpleNamespace(
+            id=user_id,
+            username=username,
+            first_name=first_name,
+            last_name=last_name
+        )
+
+    media = SimpleNamespace(file_id=file_id) if file_id else None
+
+    return SimpleNamespace(
+        from_user=sender,
+        chat=SimpleNamespace(id=chat_id),
+        message_id=message_id,
+        text=text if media_type == "text" else None,
+        caption=text if media_type != "text" else None,
+        photo=[media] if media_type == "photo" and media else None,
+        video=media if media_type == "video" else None,
+        voice=media if media_type == "voice" else None,
+        video_note=media if media_type == "video_note" else None,
+        document=media if media_type == "document" else None,
+        audio=media if media_type == "audio" else None,
+        animation=media if media_type == "animation" else None,
+        sticker=media if media_type == "sticker" else None
+    )
+
+
+def find_archived_message_for_quote(source_message, quote):
+    """Ищет в архиве сообщение, текст которого содержит цитату из ответа."""
+
+    quote_text = getattr(quote, "text", None) or ""
+    connection_id = source_message.business_connection_id
+
+    if not quote_text.strip() or not connection_id:
+        return None, False
+
+    cursor.execute("""
+        SELECT
+            message_id,
+            user_id,
+            username,
+            first_name,
+            last_name,
+            text,
+            media_type,
+            file_id
+        FROM messages
+        WHERE connection_id = ?
+          AND chat_id = ?
+          AND date <= ?
+          AND instr(COALESCE(text, ''), ?) > 0
+        ORDER BY date DESC
+        LIMIT 100
+    """, (
+        connection_id,
+        source_message.chat.id,
+        source_message.date.isoformat(),
+        quote_text
+    ))
+
+    matches = cursor.fetchall()
+    if len(matches) == 1:
+        return matches[0], False
+
+    # Если одинаковая цитата встречается в нескольких сообщениях, используем
+    # позицию цитаты, когда она однозначно оставляет одну запись.
+    quote_position = getattr(quote, "position", None)
+    if quote_position is not None and len(matches) > 1:
+        positioned_matches = []
+        for row in matches:
+            original_text = row[5] or ""
+            char_position = original_text.find(quote_text)
+            if char_position < 0:
+                continue
+            utf16_position = len(
+                original_text[:char_position].encode("utf-16-le")
+            ) // 2
+            if utf16_position == quote_position:
+                positioned_matches.append(row)
+
+        if len(positioned_matches) == 1:
+            return positioned_matches[0], False
+
+    return None, len(matches) > 1
+
+
+async def send_quote_to_admin(source_message, quote_text, ambiguous=False):
+    """Отправляет администратору цитату, если исходник найти не удалось."""
+
+    if not ADMIN_ID:
+        return
+
+    reason = (
+        "В архиве нашлось несколько сообщений с этой цитатой, поэтому "
+        "отправляю только цитату, чтобы не выбрать не тот файл."
+        if ambiguous
+        else "Telegram не передал исходное сообщение; отправляю цитату, "
+             "которую он приложил к ответу."
+    )
+
+    await bot.send_message(
+        chat_id=ADMIN_ID,
+        text=(
+            "💾 <b>ЦИТАТА ИЗ ОТВЕТА</b>\n\n"
+            f"💬 <b>Chat ID:</b> <code>{source_message.chat.id}</code>\n"
+            f"📨 <b>Message ID ответа:</b> "
+            f"<code>{source_message.message_id}</code>\n\n"
+            f"⚠️ {safe(reason)}\n\n"
+            f"<blockquote>{safe(quote_text or 'Цитата без текста')}</blockquote>"
+        ),
+        parse_mode="HTML"
+    )
+
 @dp.callback_query(
     lambda c: c.data == "command_qr"
 )
@@ -1356,28 +1489,51 @@ async def save_command(
 
     reply = message.reply_to_message
 
+    # Если исходник исчезающего сообщения не пришёл в reply_to_message,
+    # Telegram иногда передаёт его как external_reply.
     if reply is None:
+        reply = getattr(message, "external_reply", None)
 
-        try:
+    if reply is None:
+        quote = getattr(message, "quote", None)
+        quote_text = getattr(quote, "text", None) or ""
+        archived_row, ambiguous = find_archived_message_for_quote(
+            source_message=message,
+            quote=quote
+        ) if quote else (None, False)
 
-            await bot.send_message(
-                chat_id=ADMIN_ID,
-                text=(
-                    "❌ <b>.save</b>\n\n"
-                    "Команда должна быть ответом "
-                    "на сообщение."
-                ),
-                parse_mode="HTML"
+        if archived_row:
+            reply = archived_row_as_message(
+                archived_row,
+                chat_id=message.chat.id
             )
-
-        except Exception as error:
-
-            print(
-                "❌ SAVE ERROR:",
-                repr(error)
-            )
-
-        return
+        elif quote_text:
+            try:
+                await send_quote_to_admin(
+                    source_message=message,
+                    quote_text=quote_text,
+                    ambiguous=ambiguous
+                )
+            except Exception as error:
+                print("❌ SAVE QUOTE ERROR:", repr(error))
+            return
+        else:
+            try:
+                await bot.send_message(
+                    chat_id=ADMIN_ID,
+                    text=(
+                        "⚠️ <b>.save</b>\n\n"
+                        "Команда должна быть ответом на сообщение. "
+                        "Если ты отвечал на исчезающее сообщение, "
+                        "Telegram не передал боту исходник или цитату. "
+                        "Медиа без подписи в таком случае восстановить "
+                        "не получится."
+                    ),
+                    parse_mode="HTML"
+                )
+            except Exception as error:
+                print("❌ SAVE ERROR:", repr(error))
+            return
 
     print(
         "REPLY TYPE:",
