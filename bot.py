@@ -237,6 +237,23 @@ CREATE TABLE IF NOT EXISTS settings (
 
 
 # =========================================================
+# GROUP CHATS
+# =========================================================
+
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS group_chats (
+    chat_id INTEGER PRIMARY KEY,
+    title TEXT,
+    username TEXT,
+    added_by_user_id INTEGER,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT,
+    last_seen_at TEXT
+)
+""")
+
+
+# =========================================================
 # SPAM
 # =========================================================
 
@@ -506,6 +523,56 @@ def get_media_info(message):
     return media_type, file_id
 
 
+def group_connection_id(chat_id):
+    """Stable archive namespace for an ordinary group chat."""
+    return f"group:{chat_id}"
+
+
+def save_group_chat(chat, added_by_user_id=None, enabled=True):
+    """Remember group metadata for archive labels and group status."""
+    now = datetime.now(timezone.utc).isoformat()
+    cursor.execute("""
+        INSERT INTO group_chats (
+            chat_id, title, username, added_by_user_id, enabled,
+            created_at, last_seen_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(chat_id) DO UPDATE SET
+            title = excluded.title,
+            username = excluded.username,
+            added_by_user_id = COALESCE(
+                excluded.added_by_user_id, group_chats.added_by_user_id
+            ),
+            enabled = excluded.enabled,
+            last_seen_at = excluded.last_seen_at
+    """, (
+        chat.id,
+        getattr(chat, "title", None),
+        getattr(chat, "username", None),
+        added_by_user_id,
+        int(enabled),
+        now,
+        now
+    ))
+    db.commit()
+
+
+async def is_group_admin(chat_id, user_id):
+    if not user_id:
+        return False
+    try:
+        member = await bot.get_chat_member(chat_id, user_id)
+        return member.status in ("creator", "administrator")
+    except Exception as error:
+        logger.debug(
+            "Could not verify group admin: chat_id=%s user_id=%s error=%s",
+            chat_id,
+            user_id,
+            error
+        )
+        return False
+
+
 def media_name(media_type):
 
     names = {
@@ -622,6 +689,13 @@ def main_keyboard(user_id=None):
             InlineKeyboardButton(
                 text="🚀 Подключить Business",
                 callback_data="connect_business"
+            )
+        ],
+
+        [
+            InlineKeyboardButton(
+                text="👥 Подключить группу",
+                callback_data="connect_group"
             )
         ],
 
@@ -1095,7 +1169,14 @@ async def send_replied_message_to_admin(
         logger.error("ADMIN_ID не задан; пересылка ответов отключена")
         return False
 
-    connection_id = source_message.business_connection_id
+    connection_id = (
+        source_message.business_connection_id
+        or (
+            group_connection_id(source_message.chat.id)
+            if getattr(source_message.chat, "type", None) in ("group", "supergroup")
+            else None
+        )
+    )
 
     sender = getattr(reply, "from_user", None)
     if sender is None:
@@ -1122,7 +1203,7 @@ async def send_replied_message_to_admin(
         f"🆔 <b>User ID:</b> <code>{sender_id}</code>\n"
         f"💬 <b>Chat ID:</b> <code>{reply_chat_id}</code>\n"
         f"📨 <b>Message ID:</b> <code>{reply_message_id}</code>\n"
-        f"🔗 <b>Connection:</b> <code>{safe(connection_id)}</code>\n"
+        f"🧾 <b>Источник:</b> <code>{safe(connection_id)}</code>\n"
     )
 
     text = getattr(reply, "text", None) or getattr(reply, "caption", None) or ""
@@ -1390,7 +1471,14 @@ def find_archived_message_for_quote(source_message, quote):
     """Ищет в архиве сообщение, текст которого содержит цитату из ответа."""
 
     quote_text = getattr(quote, "text", None) or ""
-    connection_id = source_message.business_connection_id
+    connection_id = (
+        source_message.business_connection_id
+        or (
+            group_connection_id(source_message.chat.id)
+            if getattr(source_message.chat, "type", None) in ("group", "supergroup")
+            else None
+        )
+    )
 
     if not quote_text.strip() or not connection_id:
         return None, False
@@ -2066,7 +2154,7 @@ async def cancel_audio_converter(
         pass
 
 
-@dp.message(F.video)
+@dp.message(F.chat.type == "private", F.video)
 async def extract_audio_handler(
     message: types.Message
 ):
@@ -2271,6 +2359,7 @@ async def extract_audio_handler(
 # =========================================================
 
 @dp.message(
+    F.chat.type == "private",
     F.video
 )
 async def convert_video_handler(
@@ -3664,10 +3753,250 @@ async def deleted_business_messages_handler(
 
             logger.error('%s %s', "❌ MEDIA DELETE ERROR:", repr(error))
 # =========================================================
+# GROUP CHAT SUPPORT
+# =========================================================
+
+@dp.my_chat_member()
+async def bot_group_membership_handler(
+    event: types.ChatMemberUpdated
+):
+    if event.chat.type not in ("group", "supergroup"):
+        return
+
+    status = event.new_chat_member.status
+    is_active = status in ("member", "administrator")
+    save_group_chat(
+        event.chat,
+        added_by_user_id=getattr(event.from_user, "id", None),
+        enabled=is_active
+    )
+
+    old_status = event.old_chat_member.status
+    if is_active and old_status not in ("member", "administrator"):
+        try:
+            me = await bot.get_me()
+            group_command = f"/group@{me.username}" if me.username else "/group"
+            await bot.send_message(
+                chat_id=event.chat.id,
+                text=(
+                    "📚 <b>Архив-бот подключён к группе.</b>\n\n"
+                    "Он сохраняет сообщения и доступные медиа, которые получает, "
+                    "а ответы на сообщения пересылает администратору бота.\n"
+                    f"Напиши {group_command} для справки."
+                ),
+                parse_mode="HTML"
+            )
+        except Exception:
+            logger.exception(
+                "Could not send group welcome message: chat_id=%s",
+                event.chat.id
+            )
+
+    logger.info(
+        "Bot group membership changed: chat_id=%s title=%r status=%s",
+        event.chat.id,
+        getattr(event.chat, "title", None),
+        status
+    )
+
+
+@dp.message(Command("group"))
+async def group_help_command(message: types.Message):
+    if message.chat.type not in ("group", "supergroup"):
+        await message.answer(
+            "Добавь бота в группу, затем отправь там /group."
+        )
+        return
+
+    save_group_chat(
+        message.chat,
+        added_by_user_id=getattr(message.from_user, "id", None)
+    )
+    await message.answer(
+        "👥 <b>Бот работает в группе</b>\n\n"
+        "• сохраняет сообщения и медиа, которые Telegram ему передаёт;\n"
+        "• пересылает администратору сообщение, на которое ответили;\n"
+        "• команды: <code>/spam N текст</code>, <code>/bspam</code>, "
+        "<code>/stopspam</code> (для администраторов группы);\n"
+        "• администратор бота может открыть архив в личном чате командой "
+        "<code>/logs</code>.\n\n"
+        "Чтобы архивировать все сообщения, сделай бота администратором группы "
+        "или отключи Privacy Mode у @BotFather и заново добавь бота.\n"
+        "Удаления обычных групповых сообщений Telegram боту не присылает.",
+        parse_mode="HTML"
+    )
+
+
+@dp.edited_message(F.chat.type.in_({"group", "supergroup"}))
+async def edited_group_message_handler(message: types.Message):
+    save_group_chat(message.chat)
+    connection_id = group_connection_id(message.chat.id)
+    chat_id = message.chat.id
+    old_row = cursor.execute("""
+        SELECT text FROM messages
+        WHERE connection_id = ? AND chat_id = ? AND message_id = ?
+    """, (connection_id, chat_id, message.message_id)).fetchone()
+    old_text = old_row[0] if old_row else ""
+
+    user = message.from_user
+    sender_chat = getattr(message, "sender_chat", None)
+    user_id = user.id if user else None
+    username = user.username if user else getattr(sender_chat, "username", None)
+    first_name = user.first_name if user else getattr(sender_chat, "title", None)
+    last_name = user.last_name if user else None
+    new_text = message.text or message.caption or ""
+    media_type, file_id = get_media_info(message)
+    _, save_media, edit_notifications = get_settings(chat_id)
+    if not save_media and media_type != "text":
+        media_type, file_id = "text", None
+
+    cursor.execute("""
+        INSERT OR REPLACE INTO messages (
+            connection_id, chat_id, message_id,
+            user_id, username, first_name, last_name,
+            chat_username, chat_first_name, chat_last_name,
+            text, date, media_type, file_id, deleted
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
+    """, (
+        connection_id, chat_id, message.message_id,
+        user_id, username, first_name, last_name,
+        getattr(message.chat, "username", None), None, None,
+        new_text, message.date.isoformat(), media_type, file_id
+    ))
+    db.commit()
+
+    if edit_notifications and old_text != new_text:
+        sender = _display_person_name(first_name, last_name, username, user_id)
+        old_html, new_html = make_diff_html(old_text, new_text)
+        try:
+            await bot.send_message(
+                chat_id=chat_id,
+                text=(
+                    f"✏️ <b>{safe(sender)}</b> изменил(а) сообщение.\n\n"
+                    f"<b>Было:</b> <blockquote>{old_html}</blockquote>\n"
+                    f"<b>Стало:</b> <blockquote>{new_html}</blockquote>"
+                ),
+                parse_mode="HTML"
+            )
+        except Exception:
+            logger.exception(
+                "Could not post group edit notice: chat_id=%s message_id=%s",
+                chat_id,
+                message.message_id
+            )
+
+
+async def handle_group_spam_command(message: types.Message, command, args):
+    chat_id = message.chat.id
+    if not await is_group_admin(
+        chat_id,
+        getattr(message.from_user, "id", None)
+    ):
+        await message.reply("⛔ Команда доступна только администраторам группы.")
+        return True
+
+    connection_id = group_connection_id(chat_id)
+
+    if command in (".spam", "/spam"):
+        parts = args.split(maxsplit=1)
+        if len(parts) < 2:
+            await message.reply(
+                "Формат: <code>/spam N текст</code>\n"
+                "Например: <code>/spam 3 Привет</code>",
+                parse_mode="HTML"
+            )
+            return True
+        try:
+            count = int(parts[0])
+        except ValueError:
+            await message.reply("N должно быть числом.")
+            return True
+        text = parts[1].strip()
+        if not text or count < 1 or count > MAX_SPAM_COUNT:
+            await message.reply(f"Укажи от 1 до {MAX_SPAM_COUNT} сообщений и текст.")
+            return True
+        if chat_id in active_spam_tasks:
+            await message.reply("В этой группе уже выполняется рассылка.")
+            return True
+
+        try:
+            await message.delete()
+        except Exception:
+            pass
+
+        stop_event = asyncio.Event()
+        active_spam_tasks[chat_id] = stop_event
+        sent_count = 0
+        try:
+            for _ in range(count):
+                if stop_event.is_set():
+                    break
+                sent = await bot.send_message(chat_id=chat_id, text=text)
+                cursor.execute("""
+                    INSERT INTO spam_messages (
+                        owner_id, connection_id, chat_id, message_id, created_at
+                    ) VALUES (?, ?, ?, ?, ?)
+                """, (
+                    chat_id, connection_id, chat_id, sent.message_id,
+                    datetime.now(timezone.utc).isoformat()
+                ))
+                db.commit()
+                sent_count += 1
+                await asyncio.sleep(3.1)
+        except Exception:
+            logger.exception("Group spam command failed: chat_id=%s", chat_id)
+            await bot.send_message(chat_id, "❌ Не удалось продолжить отправку.")
+        finally:
+            active_spam_tasks.pop(chat_id, None)
+        logger.info("Group spam finished: chat_id=%s sent=%s", chat_id, sent_count)
+        return True
+
+    if command in (".bspam", "/bspam"):
+        rows = cursor.execute("""
+            SELECT message_id FROM spam_messages
+            WHERE owner_id = ? AND connection_id = ? AND chat_id = ?
+            ORDER BY id ASC
+        """, (chat_id, connection_id, chat_id)).fetchall()
+        removed = 0
+        for (message_id,) in rows:
+            try:
+                await bot.delete_message(chat_id=chat_id, message_id=message_id)
+                cursor.execute("""
+                    DELETE FROM spam_messages
+                    WHERE owner_id = ? AND connection_id = ?
+                      AND chat_id = ? AND message_id = ?
+                """, (chat_id, connection_id, chat_id, message_id))
+                removed += 1
+            except Exception as error:
+                logger.debug(
+                    "Could not remove group spam message: chat_id=%s message_id=%s error=%s",
+                    chat_id, message_id, error
+                )
+        db.commit()
+        try:
+            await message.delete()
+        except Exception:
+            pass
+        await bot.send_message(chat_id, f"🗑 Удалено сообщений: {removed}.")
+        return True
+
+    if command in (".stopspam", "/stopspam"):
+        event = active_spam_tasks.get(chat_id)
+        if event is None:
+            await message.reply("Сейчас в группе ничего не отправляется.")
+        else:
+            event.set()
+            await message.reply("⏹ Останавливаю отправку…")
+        return True
+
+    return False
+
+
+# =========================================================
 # QR CODE GENERATOR
 # =========================================================
 
-@dp.message(F.text & ~F.text.startswith("/"))
+@dp.message(F.chat.type == "private", F.text & ~F.text.startswith("/"))
 async def qr_message_handler(
     message: types.Message
 ):
@@ -3803,6 +4132,16 @@ async def menu_command(
     message: types.Message
 ):
 
+    if message.chat.type in ("group", "supergroup"):
+        save_group_chat(
+            message.chat,
+            added_by_user_id=getattr(message.from_user, "id", None)
+        )
+        await message.answer(
+            "Бот подключён к группе. Справка по функциям: /group."
+        )
+        return
+
     owner_id = message.from_user.id
 
     try:
@@ -3875,6 +4214,40 @@ async def connect_business(
 
         back_keyboard()
     )
+
+
+@dp.callback_query(lambda c: c.data == "connect_group")
+async def connect_group(callback: CallbackQuery):
+    try:
+        me = await bot.get_me()
+        if not me.username:
+            await replace_menu(
+                callback,
+                "Не удалось получить username бота. Добавь его в группу через профиль бота.",
+                back_keyboard()
+            )
+            return
+
+        group_url = f"https://t.me/{me.username}?startgroup=true"
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="➕ Выбрать группу", url=group_url)],
+            [InlineKeyboardButton(text="⬅️ Назад", callback_data="open_menu")]
+        ])
+        await replace_menu(
+            callback,
+            "👥 <b>Подключить группу</b>\n\n"
+            "Нажми кнопку и выбери группу. После добавления бот начнёт "
+            "сохранять сообщения и доступные медиа, которые получает, "
+            "а ответы пересылать администратору бота.\n\n"
+            "Для получения всех сообщений сделай бота администратором группы "
+            "или отключи Privacy Mode у @BotFather и добавь бота в группу заново.\n"
+            "Справка в группе: /group. Команды /spam и /bspam доступны "
+            "администраторам группы.",
+            keyboard
+        )
+    except Exception:
+        logger.exception("Could not build group invite link")
+        await callback.answer("Не удалось подготовить ссылку добавления.", show_alert=True)
 
 
 # =========================================================
@@ -4029,6 +4402,20 @@ def _lookup_peer_name(connection_id, chat_id, owner_id=None,
     """
     identity = None
 
+    if connection_id and str(connection_id).startswith("group:"):
+        cursor.execute("""
+            SELECT title, username
+            FROM group_chats
+            WHERE chat_id = ?
+        """, (chat_id,))
+        group_row = cursor.fetchone()
+        if group_row:
+            if group_row[0]:
+                return group_row[0]
+            if group_row[1]:
+                return f"@{group_row[1]}"
+        return f"Группа {chat_id}"
+
     if connection_id:
         cursor.execute("""
             SELECT chat_username, chat_first_name, chat_last_name
@@ -4057,6 +4444,17 @@ def _lookup_peer_name(connection_id, chat_id, owner_id=None,
             """, (connection_id, chat_id, owner_id, owner_id))
             identity = cursor.fetchone()
     else:
+        cursor.execute("""
+            SELECT title, username
+            FROM group_chats
+            WHERE chat_id = ?
+        """, (chat_id,))
+        group_row = cursor.fetchone()
+        if group_row and group_row[0]:
+            return group_row[0]
+        if group_row and group_row[1]:
+            return f"@{group_row[1]}"
+
         cursor.execute("""
             SELECT chat_username, chat_first_name, chat_last_name
             FROM messages
@@ -4125,6 +4523,9 @@ def _admin_log_participants(row):
     sender_name = _display_person_name(
         first_name, last_name, username, user_id
     )
+
+    if connection_id and str(connection_id).startswith("group:"):
+        return sender_name, peer_name, peer_name, peer_name
 
     if owner_id and user_id == owner_id:
         sender, recipient = owner_name, peer_name
@@ -4197,11 +4598,11 @@ def build_admin_logs_text(limit=20, chat_id=None):
 
     if not rows:
         if chat_id is None:
-            return "📋 <b>Логи Business-переписки</b>\n\nПока нет сохранённых сообщений."
+            return "📋 <b>Последние логи переписки</b>\n\nПока нет сохранённых сообщений."
         label = _lookup_peer_name(None, chat_id) if chat_id is not None else ""
-        return f"📋 <b>Логи: {safe(label)}</b>\n\nСообщений не найдено." if chat_id is not None else "📋 <b>Логи Business-переписки</b>\n\nПока нет сохранённых сообщений."
+        return f"📋 <b>Логи: {safe(label)}</b>\n\nСообщений не найдено." if chat_id is not None else "📋 <b>Последние логи переписки</b>\n\nПока нет сохранённых сообщений."
 
-    title = "📋 <b>Последние логи Business-переписки</b>"
+    title = "📋 <b>Последние логи переписки</b>"
     if chat_id is not None:
         label = _lookup_peer_name(None, chat_id)
         title = f"📋 <b>Логи: {safe(label)}</b>"
@@ -4214,8 +4615,9 @@ def build_admin_logs_text(limit=20, chat_id=None):
 
     for (connection_id, row_chat_id), chat_rows in grouped_rows.items():
         peer_name = _lookup_peer_name(connection_id, row_chat_id)
+        dialog_label = "Группа" if str(connection_id).startswith("group:") else "Диалог"
         result.append(
-            f"💬 <b>Диалог: {safe(peer_name)}</b> · "
+            f"💬 <b>{dialog_label}: {safe(peer_name)}</b> · "
             f"<code>{row_chat_id}</code>"
         )
 
@@ -4553,6 +4955,9 @@ async def admin_logs_command(message: types.Message):
     if not ADMIN_ID or not message.from_user or message.from_user.id != ADMIN_ID:
         await message.answer("⛔ Команда доступна только администратору.")
         return
+    if message.chat.type != "private":
+        await message.answer("Открой личный чат с ботом и отправь /logs — архив не публикуется в группе.")
+        return
     text = build_admin_logs_text(20)
     media_ids = get_recent_admin_log_media(20)
     await message.answer(text, parse_mode="HTML", reply_markup=admin_logs_keyboard(media_ids))
@@ -4576,7 +4981,7 @@ def build_admin_logs_file(chat_id=None):
         return None, 0
 
     lines = [
-        "BUSINESS ARCHIVE — ЛОГИ ПЕРЕПИСКИ",
+        "MESSAGE ARCHIVE — ЛОГИ ПЕРЕПИСКИ",
         f"Создано: {moscow_time()}",
         f"Количество сообщений: {len(rows)}",
         "Фильтр: все пользователи" if chat_id is None else f"Фильтр: пользователь Chat ID {chat_id}",
@@ -4594,9 +4999,10 @@ def build_admin_logs_file(chat_id=None):
             lines.extend([
                 "",
                 "#" * 72,
-                f"ДИАЛОГ: {owner_name} ↔ {peer_name}",
+                f"ГРУППА: {peer_name}" if str(connection_id).startswith("group:")
+                else f"ДИАЛОГ: {owner_name} ↔ {peer_name}",
                 f"Chat ID: {row_chat_id}",
-                f"Business connection: {connection_id}",
+                f"Источник: {'группа' if str(connection_id).startswith('group:') else 'Business'} · {connection_id}",
                 "#" * 72,
                 "",
             ])
@@ -5324,6 +5730,10 @@ async def private_settings_command(
     message: types.Message
 ):
 
+    if message.chat.type != "private":
+        await message.answer("Настройки доступны в личном чате с ботом.")
+        return
+
     try:
         await message.delete()
     except Exception:
@@ -5398,6 +5808,10 @@ async def private_settings_command(
 async def private_stats_command(
     message: types.Message
 ):
+
+    if message.chat.type != "private":
+        await message.answer("Статистика доступна в личном чате с ботом.")
+        return
 
     try:
         await message.delete()
@@ -5505,6 +5919,10 @@ async def private_deleted_command(
     message: types.Message
 ):
 
+    if message.chat.type != "private":
+        await message.answer("Архив удалённых сообщений доступен в личном чате с ботом.")
+        return
+
     try:
         await message.delete()
     except Exception:
@@ -5606,6 +6024,68 @@ async def private_deleted_command(
         message.chat.id,
         sent.message_id
     )
+
+
+@dp.message(F.chat.type.in_({"group", "supergroup"}))
+async def group_message_handler(message: types.Message):
+    save_group_chat(message.chat)
+
+    message_text = (message.text or "").strip()
+    if message_text:
+        command_parts = message_text.split(maxsplit=1)
+        command = command_parts[0].split("@", 1)[0].lower()
+        args = command_parts[1] if len(command_parts) > 1 else ""
+        if await handle_group_spam_command(message, command, args):
+            return
+
+    connection_id = group_connection_id(message.chat.id)
+    if message.from_user and message.from_user.is_bot:
+        return
+
+    user = message.from_user
+    sender_chat = getattr(message, "sender_chat", None)
+    user_id = user.id if user else None
+    username = user.username if user else getattr(sender_chat, "username", None)
+    first_name = user.first_name if user else getattr(sender_chat, "title", None)
+    last_name = user.last_name if user else None
+    text = message.text or message.caption or ""
+    media_type, file_id = get_media_info(message)
+    _, save_media, _ = get_settings(message.chat.id)
+    if not save_media and media_type != "text":
+        media_type, file_id = "text", None
+
+    cursor.execute("""
+        INSERT OR REPLACE INTO messages (
+            connection_id, chat_id, message_id,
+            user_id, username, first_name, last_name,
+            chat_username, chat_first_name, chat_last_name,
+            text, date, media_type, file_id, deleted
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
+    """, (
+        connection_id, message.chat.id, message.message_id,
+        user_id, username, first_name, last_name,
+        getattr(message.chat, "username", None), None, None,
+        text, message.date.isoformat(), media_type, file_id
+    ))
+    db.commit()
+    logger.debug(
+        "Group message archived: chat_id=%s message_id=%s media_type=%s user_id=%s",
+        message.chat.id, message.message_id, media_type, user_id or "unknown"
+    )
+
+    if (
+        message.reply_to_message
+        or getattr(message, "external_reply", None)
+        or getattr(message, "quote", None)
+    ):
+        try:
+            await forward_replied_message_to_admin(message)
+        except Exception:
+            logger.exception(
+                "Group reply forwarding failed: chat_id=%s message_id=%s",
+                message.chat.id,
+                message.message_id
+            )
 
 
 ## =========================================================
