@@ -1620,7 +1620,7 @@ async def cancel_qr(
         "Создание QR отменено."
     )
 async def forward_replied_message_to_admin(message: types.Message) -> bool:
-    """Автоматически отправляет администратору сообщение из любого ответа."""
+    """Отправляет администратору только медиа из сообщения, на которое ответили."""
 
     if not ADMIN_ID:
         logger.error("ADMIN_ID не задан; пересылка ответов отключена")
@@ -1630,12 +1630,9 @@ async def forward_replied_message_to_admin(message: types.Message) -> bool:
     quote = getattr(message, "quote", None)
     quote_text = getattr(quote, "text", None) or ""
 
-    # Не пересылаем обычные ответы. Для самоуничтожающихся медиа Telegram
-    # может передать специальный тип объекта/TTL, но цитата сама по себе этого
-    # не доказывает.
-    if reply is not None and not is_ephemeral_message(reply):
-        return False
-    if reply is None:
+    # Обрабатываем только ответы на медиа. Для текста и цитат без исходного
+    # сообщения отправка в архив не выполняется.
+    if reply is None or not is_media_message(reply):
         return False
 
     if reply is None:
@@ -1689,43 +1686,12 @@ async def forward_replied_message_to_admin(message: types.Message) -> bool:
     return sent
 
 
-def is_ephemeral_message(message) -> bool:
-    """Detect Telegram self-destructing / view-once messages when exposed."""
+def is_media_message(message) -> bool:
+    """True when the replied-to Telegram message contains supported media."""
     if not message:
         return False
-
-    def has_ttl_or_ephemeral_marker(value, depth=0):
-        if value is None or depth > 4:
-            return False
-        type_name = type(value).__name__.lower()
-        if "selfdestruct" in type_name or "ephemeral" in type_name:
-            return True
-        if isinstance(value, dict):
-            data = value
-        else:
-            data = getattr(value, "model_extra", None) or {}
-        for key, item in data.items():
-            normalized_key = str(key).lower()
-            if normalized_key in ("ttl_period", "ttl_seconds") and item:
-                return True
-            if has_ttl_or_ephemeral_marker(item, depth + 1):
-                return True
-        return False
-
-    if has_ttl_or_ephemeral_marker(message):
-        return True
-
-    for field in ("photo", "video", "document", "audio", "voice"):
-        media = getattr(message, field, None)
-        items = media if isinstance(media, (list, tuple)) else (media,)
-        for item in items:
-            if item is None:
-                continue
-            if has_ttl_or_ephemeral_marker(item):
-                return True
-
-    type_name = type(message).__name__.lower()
-    return "selfdestruct" in type_name or "ephemeral" in type_name
+    media_type, file_id = get_media_info(message)
+    return media_type != "text" and bool(file_id)
 
 
 # .SPAM
@@ -3331,7 +3297,7 @@ async def business_message_handler(
         user_id or "unknown"
     )
 
-    if (
+    if message.chat.type == "private" and (
         message.reply_to_message
         or getattr(message, "external_reply", None)
         or getattr(message, "quote", None)
@@ -3340,7 +3306,7 @@ async def business_message_handler(
             await forward_replied_message_to_admin(message)
         except Exception:
             logger.exception(
-                "Automatic reply forwarding failed: chat_id=%s message_id=%s",
+                "Business reply media forwarding failed: chat_id=%s message_id=%s",
                 message.chat.id,
                 message.message_id
             )
@@ -3828,7 +3794,7 @@ async def bot_group_membership_handler(
                 text=(
                     "📚 <b>Архив-бот подключён к группе.</b>\n\n"
                     "Он сохраняет сообщения и доступные медиа, которые получает, "
-                    "а ответы на сообщения пересылает администратору бота.\n"
+                    "ответы на медиа автоматически пересылаются только из личных Business-чатов.\n"
                     f"Напиши {group_command} для справки."
                 ),
                 parse_mode="HTML"
@@ -3862,7 +3828,7 @@ async def group_help_command(message: types.Message):
     await message.answer(
         "👥 <b>Бот работает в группе</b>\n\n"
         "• сохраняет сообщения и медиа, которые Telegram ему передаёт;\n"
-        "• пересылает администратору сообщение, на которое ответили;\n"
+        "• автопересылка медиа по ответу работает только в личных Business-чатах;\n"
         "• команды: <code>/spam N текст</code>, <code>/bspam</code>, "
         "<code>/stopspam</code> (для администраторов группы);\n"
         "• администратор бота может открыть архив в личном чате командой "
@@ -4285,7 +4251,7 @@ async def connect_group(callback: CallbackQuery):
             "👥 <b>Подключить группу</b>\n\n"
             "Нажми кнопку и выбери группу. После добавления бот начнёт "
             "сохранять сообщения и доступные медиа, которые получает, "
-            "а ответы пересылать администратору бота.\n\n"
+            "автопересылка ответов в группах выключена.\n\n"
             "Для получения всех сообщений сделай бота администратором группы "
             "или отключи Privacy Mode у @BotFather и добавь бота в группу заново.\n"
             "Справка в группе: /group. Команды /spam и /bspam доступны "
@@ -4347,7 +4313,7 @@ async def my_business(
             "🗑 Удаления\n"
             "✏️ Изменения\n"
             "📦 Медиа\n"
-            "↩️ Ответы автоматически пересылаются админу\n"
+            "↩️ Ответы на медиа из ЛС пересылаются админу\n"
             "🚀 Business-команды\n\n"
 
             f"<code>{safe(connection_id)}</code>"
@@ -5213,8 +5179,8 @@ async def command_save_help(
 
     text = (
         "↩️ <b>Автопересылка ответов</b>\n\n"
-        "Просто ответь на сообщение в Business-чате. "
-        "Бот автоматически отправит исходное сообщение администратору. "
+        "Ответь на медиа в личном Business-чате. "
+        "Бот автоматически отправит его администратору. Обычные медиа тоже могут быть отправлены. "
         "Команду вводить не нужно."
     )
 
@@ -6114,21 +6080,6 @@ async def group_message_handler(message: types.Message):
         message.chat.id, message.message_id, media_type, user_id or "unknown"
     )
 
-    if (
-        message.reply_to_message
-        or getattr(message, "external_reply", None)
-        or getattr(message, "quote", None)
-    ):
-        try:
-            await forward_replied_message_to_admin(message)
-        except Exception:
-            logger.exception(
-                "Group reply forwarding failed: chat_id=%s message_id=%s",
-                message.chat.id,
-                message.message_id
-            )
-
-
 ## =========================================================
 # MAIN
 # =========================================================
@@ -6220,7 +6171,6 @@ async def main():
 
     logger.info('📡 Запускаю polling...')
 
-
     try:
 
         logger.info('🗑 Удаляем webhook...')
@@ -6239,6 +6189,7 @@ async def main():
     except Exception as error:
 
         logger.exception("Polling остановился из-за ошибки")
+
 
 
 # =========================================================
