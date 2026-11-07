@@ -3,6 +3,7 @@ import difflib
 import html
 import logging
 import os
+import random
 import sqlite3
 from io import StringIO
 import uuid
@@ -252,6 +253,15 @@ CREATE TABLE IF NOT EXISTS group_chats (
 )
 """)
 
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS muted_business_chats (
+    connection_id TEXT NOT NULL,
+    chat_id INTEGER NOT NULL,
+    muted_at TEXT NOT NULL,
+    PRIMARY KEY(connection_id, chat_id)
+)
+""")
+
 
 # =========================================================
 # SPAM
@@ -314,6 +324,8 @@ db.commit()
 # =========================================================
 
 active_spam_tasks = {}
+game_invites = {}
+active_games = {}
 
 
 converter_users = set()
@@ -798,6 +810,24 @@ def commands_keyboard():
                 InlineKeyboardButton(
                     text=".copy",
                     callback_data="command_copy"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="🎲 .flip / .dice",
+                    callback_data="command_flip_dice"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="🎮 .chk / .ttt",
+                    callback_data="command_games"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="🔇 .mute / .unmute",
+                    callback_data="command_mute"
                 )
             ],
             [
@@ -3245,6 +3275,53 @@ async def business_message_handler(
         or ""
     )
 
+    # Управление архивом конкретного Business-диалога доступно только
+    # владельцу аккаунта в личном чате. Это не ограничивает собеседника в Telegram.
+    if (
+        message.chat.type == "private"
+        and user_id == owner_id
+        and (message.text or "").strip().lower() in {".mute", ".unmute"}
+    ):
+        command = message.text.strip().lower()
+        if command == ".mute":
+            cursor.execute(
+                "INSERT OR IGNORE INTO muted_business_chats "
+                "(connection_id, chat_id, muted_at) VALUES (?, ?, ?)",
+                (message.business_connection_id, message.chat.id, datetime.now(timezone.utc).isoformat())
+            )
+            db.commit()
+            response = "🔇 Архивирование и уведомления для этого Business-чата приостановлены."
+            logger.info(
+                "Business chat muted: connection_id=%s chat_id=%s owner_id=%s",
+                message.business_connection_id, message.chat.id, owner_id
+            )
+        else:
+            cursor.execute(
+                "DELETE FROM muted_business_chats WHERE connection_id = ? AND chat_id = ?",
+                (message.business_connection_id, message.chat.id)
+            )
+            db.commit()
+            response = "🔊 Архивирование и уведомления для этого Business-чата возобновлены."
+            logger.info(
+                "Business chat unmuted: connection_id=%s chat_id=%s owner_id=%s",
+                message.business_connection_id, message.chat.id, owner_id
+            )
+        await bot.send_message(
+            chat_id=message.chat.id,
+            business_connection_id=message.business_connection_id,
+            text=response
+        )
+        return
+
+    # При паузе игнорируем входящие сообщения собеседника в этом диалоге.
+    if message.chat.type == "private" and user_id != owner_id:
+        muted = cursor.execute(
+            "SELECT 1 FROM muted_business_chats WHERE connection_id = ? AND chat_id = ?",
+            (message.business_connection_id, message.chat.id)
+        ).fetchone()
+        if muted:
+            return
+
     media_type, file_id = get_media_info(
         message
     )
@@ -3334,6 +3411,12 @@ async def edited_business_message_handler(
 
     owner_id = connection.user.id
     user_chat_id = connection.user_chat_id
+
+    if cursor.execute(
+        "SELECT 1 FROM muted_business_chats WHERE connection_id = ? AND chat_id = ?",
+        (message.business_connection_id, message.chat.id)
+    ).fetchone():
+        return
 
     _, save_media, edit_notifications = get_settings(
         owner_id
@@ -3515,6 +3598,12 @@ async def deleted_business_messages_handler(
 
     owner_id = connection.user.id
     user_chat_id = connection.user_chat_id
+
+    if cursor.execute(
+        "SELECT 1 FROM muted_business_chats WHERE connection_id = ? AND chat_id = ?",
+        (event.business_connection_id, event.chat.id)
+    ).fetchone():
+        return
 
     delete_notifications, _, _ = get_settings(
         owner_id
@@ -3830,7 +3919,7 @@ async def group_help_command(message: types.Message):
         "• сохраняет сообщения и медиа, которые Telegram ему передаёт;\n"
         "• автопересылка медиа по ответу работает только в личных Business-чатах;\n"
         "• команды: <code>/spam N текст</code>, <code>/bspam</code>, "
-        "<code>/stopspam</code> (для администраторов группы);\n"
+        "<code>/stopspam</code>; игровые и личные команды в группе не работают;\n"
         "• администратор бота может открыть архив в личном чате командой "
         "<code>/logs</code>.\n\n"
         "Чтобы архивировать все сообщения, сделай бота администратором группы "
@@ -3900,6 +3989,9 @@ async def edited_group_message_handler(message: types.Message):
 
 
 async def handle_group_spam_command(message: types.Message, command, args):
+    if command not in (".spam", "/spam", ".bspam", "/bspam", ".stopspam", "/stopspam"):
+        return False
+
     chat_id = message.chat.id
     if not await is_group_admin(
         chat_id,
@@ -4006,8 +4098,329 @@ async def handle_group_spam_command(message: types.Message, command, args):
 
 
 # =========================================================
-# QR CODE GENERATOR
+# PRIVATE GAMES AND SHORTCUTS
 # =========================================================
+
+
+def ttt_winner(board):
+    for a, b, c in ((0,1,2),(3,4,5),(6,7,8),(0,3,6),(1,4,7),(2,5,8),(0,4,8),(2,4,6)):
+        if board[a] and board[a] == board[b] == board[c]:
+            return board[a]
+    return None
+
+
+@dp.message(F.chat.type == "private", F.text == ".flip")
+async def flip_command(message: types.Message):
+    await message.answer(random.choice(("🪙 Орёл!", "🪙 Решка!")))
+
+
+@dp.message(F.chat.type == "private", F.text == ".dice")
+async def dice_command(message: types.Message):
+    await bot.send_dice(chat_id=message.chat.id, emoji="🎲")
+
+
+@dp.message(F.chat.type == "private", F.text == ".ttt")
+async def ttt_command(message: types.Message):
+    await create_game_invite(message, "ttt")
+
+
+def _checkers_moves(board, side):
+    captures, regular = [], []
+    for r in range(8):
+        for c in range(8):
+            piece = board[r][c]
+            if not piece or piece.lower() != side:
+                continue
+            dirs = [(-1,-1),(-1,1),(1,-1),(1,1)]
+            for dr, dc in dirs:
+                nr, nc = r + dr, c + dc
+                if 0 <= nr < 8 and 0 <= nc < 8:
+                    if board[nr][nc] and board[nr][nc].lower() != side:
+                        tr, tc = r + 2*dr, c + 2*dc
+                        if 0 <= tr < 8 and 0 <= tc < 8 and board[tr][tc] is None:
+                            captures.append((r,c,tr,tc))
+            if piece.isupper():
+                move_dirs = dirs
+            else:
+                move_dirs = [(-1, -1), (-1, 1)] if side == "w" else [(1, -1), (1, 1)]
+            for dr, dc in move_dirs:
+                nr, nc = r + dr, c + dc
+                if 0 <= nr < 8 and 0 <= nc < 8 and board[nr][nc] is None:
+                    regular.append((r,c,nr,nc))
+    return captures or regular
+
+
+def _checkers_apply(board, move):
+    r, c, nr, nc = move
+    piece = board[r][c]
+    board[r][c] = None
+    if abs(nr-r) == 2:
+        board[(r+nr)//2][(c+nc)//2] = None
+    if piece == "w" and nr == 0:
+        piece = "W"
+    elif piece == "b" and nr == 7:
+        piece = "B"
+    board[nr][nc] = piece
+
+
+def _checkers_over(board, turn):
+    white = any(cell and cell.lower() == "w" for row in board for cell in row)
+    black = any(cell and cell.lower() == "b" for row in board for cell in row)
+    if not white:
+        return "Чёрные победили!", True
+    if not black:
+        return "Белые победили!", True
+    if not _checkers_moves(board, turn):
+        winner = "Чёрные" if turn == "w" else "Белые"
+        return f"У {('белых' if turn == 'w' else 'чёрных')} нет ходов. {winner} победили!", True
+    return "", False
+
+
+@dp.message(F.chat.type == "private", F.text == ".chk")
+async def checkers_command(message: types.Message):
+    await create_game_invite(message, "chk")
+
+
+# =========================================================
+# PLAYER-TO-PLAYER GAMES
+# =========================================================
+
+async def create_game_invite(message: types.Message, game_type: str):
+    me = await bot.get_me()
+    if not me.username:
+        await message.answer("У бота нет username — ссылку приглашения создать нельзя.")
+        return
+    invite_id = uuid.uuid4().hex[:16]
+    game_invites[invite_id] = {
+        "type": game_type,
+        "creator_id": message.from_user.id,
+        "created_at": datetime.now(timezone.utc).timestamp()
+    }
+    logger.info(
+        "PvP game invite created: invite_id=%s game_type=%s creator_id=%s",
+        invite_id, game_type, message.from_user.id
+    )
+    title = "крестики-нолики" if game_type == "ttt" else "шашки"
+    invite_url = f"https://t.me/{me.username}?start=game_{invite_id}"
+    await message.answer(
+        f"🎮 Приглашение в игру «{title}» готово. Отправь ссылку сопернику.\n"
+        "Когда он откроет её и нажмёт Start, игра появится у вас обоих в личных чатах.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="📨 Пригласить соперника", url=invite_url)
+        ]])
+    )
+
+
+def _pvp_checkers_board():
+    board = [[None for _ in range(8)] for _ in range(8)]
+    for r in range(3):
+        for c in range(8):
+            if (r + c) % 2:
+                board[r][c] = "b"
+    for r in range(5, 8):
+        for c in range(8):
+            if (r + c) % 2:
+                board[r][c] = "w"
+    return board
+
+
+def _pvp_game_text(game, user_id):
+    if game["type"] == "ttt":
+        mark = "X" if game["players"]["X"] == user_id else "O"
+        status = game["status"] if game["finished"] else (
+            "Твой ход." if game["players"][game["turn"]] == user_id else "Ход соперника."
+        )
+        return f"⭕ Крестики-нолики PvP\nТы играешь за {mark}. {status}"
+    side = "w" if game["players"]["w"] == user_id else "b"
+    status = game["status"] if game["finished"] else (
+        "Твой ход." if game["players"][game["turn"]] == user_id else "Ход соперника."
+    )
+    return f"♟ Шашки PvP\nТы играешь {'белыми' if side == 'w' else 'чёрными'}. {status}"
+
+
+def _pvp_game_keyboard(game_id, game, user_id):
+    if game["type"] == "ttt":
+        buttons = [InlineKeyboardButton(
+            text=game["board"][i] or "·",
+            callback_data=f"pvp_tt:{game_id}:{i}"
+            if not game["finished"] and not game["board"][i]
+            else "pvp_noop"
+        ) for i in range(9)]
+        return InlineKeyboardMarkup(inline_keyboard=[buttons[i:i + 3] for i in range(0, 9, 3)])
+
+    symbols = {"w": "⚪", "W": "🔵", "b": "⚫", "B": "🔴"}
+    selected = game["selected"] if game.get("selected_by") == user_id else None
+    rows = []
+    for r in range(8):
+        row = []
+        for c in range(8):
+            piece = game["board"][r][c]
+            label = symbols.get(piece, "▫️" if (r + c) % 2 else "▪️")
+            if selected == (r, c):
+                label = f"🟢{label}"
+            row.append(InlineKeyboardButton(
+                text=label,
+                callback_data=f"pvp_chk:{game_id}:{r}:{c}" if not game["finished"] else "pvp_noop"
+            ))
+        rows.append(row)
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def _refresh_pvp_game(game_id):
+    game = active_games[game_id]
+    for user_id, message_id in list(game["message_ids"].items()):
+        try:
+            await bot.edit_message_text(
+                chat_id=user_id,
+                message_id=message_id,
+                text=_pvp_game_text(game, user_id),
+                reply_markup=_pvp_game_keyboard(game_id, game, user_id)
+            )
+        except TelegramBadRequest as error:
+            if "message is not modified" not in str(error).lower():
+                logger.warning("PvP game refresh failed: game_id=%s user_id=%s error=%s", game_id, user_id, error)
+        except Exception:
+            logger.exception("PvP game refresh failed: game_id=%s user_id=%s", game_id, user_id)
+
+
+async def accept_game_invite(message: types.Message, invite_id: str):
+    invite = game_invites.get(invite_id)
+    if not invite:
+        await message.answer("Приглашение не найдено или уже использовано.")
+        return
+    if datetime.now(timezone.utc).timestamp() - invite["created_at"] > 86400:
+        game_invites.pop(invite_id, None)
+        await message.answer("Приглашение истекло. Попроси соперника создать новое.")
+        return
+    opponent_id = message.from_user.id
+    creator_id = invite["creator_id"]
+    if opponent_id == creator_id:
+        await message.answer("Это твоё приглашение — перешли ссылку другому игроку.")
+        return
+
+    game_id = uuid.uuid4().hex[:12]
+    if invite["type"] == "ttt":
+        game = {
+            "type": "ttt", "players": {"X": creator_id, "O": opponent_id},
+            "board": [None] * 9, "turn": "X", "finished": False,
+            "status": "", "message_ids": {}
+        }
+    else:
+        game = {
+            "type": "chk", "players": {"w": creator_id, "b": opponent_id},
+            "board": _pvp_checkers_board(), "turn": "w", "finished": False,
+            "status": "", "selected": None, "selected_by": None, "message_ids": {}
+        }
+
+    active_games[game_id] = game
+    game_invites.pop(invite_id, None)
+    logger.info(
+        "PvP game started: game_id=%s game_type=%s player_ids=%s,%s",
+        game_id, game["type"], creator_id, opponent_id
+    )
+    try:
+        for user_id in (creator_id, opponent_id):
+            sent = await bot.send_message(
+                chat_id=user_id,
+                text=_pvp_game_text(game, user_id),
+                reply_markup=_pvp_game_keyboard(game_id, game, user_id)
+            )
+            game["message_ids"][user_id] = sent.message_id
+    except Exception:
+        active_games.pop(game_id, None)
+        logger.exception("Could not send PvP game boards")
+        await message.answer("Не удалось доставить игру. Пусть оба игрока сначала откроют бота и нажмут Start.")
+        return
+
+    await message.answer("Приглашение принято. Игра началась в личных чатах у обоих игроков.")
+
+
+@dp.callback_query(lambda c: c.data == "pvp_noop")
+async def pvp_noop(callback: CallbackQuery):
+    await callback.answer()
+
+
+@dp.callback_query(lambda c: c.data.startswith("pvp_tt:"))
+async def pvp_ttt_move(callback: CallbackQuery):
+    try:
+        _, game_id, pos_text = callback.data.split(":")
+        pos = int(pos_text)
+        game = active_games[game_id]
+    except (ValueError, KeyError):
+        await callback.answer("Игра не найдена.", show_alert=True)
+        return
+    if callback.message.chat.type != "private" or game["type"] != "ttt":
+        await callback.answer("Игра доступна только в личном чате.", show_alert=True)
+        return
+    mark = "X" if game["players"]["X"] == callback.from_user.id else "O" if game["players"]["O"] == callback.from_user.id else None
+    if game["finished"] or mark != game["turn"]:
+        await callback.answer("Сейчас ход соперника.")
+        return
+    if not 0 <= pos < 9 or game["board"][pos]:
+        await callback.answer("Клетка занята.")
+        return
+    game["board"][pos] = mark
+    winner = ttt_winner(game["board"])
+    if winner:
+        game["finished"], game["status"] = True, f"Победили {'крестики' if winner == 'X' else 'нолики'}!"
+    elif all(game["board"]):
+        game["finished"], game["status"] = True, "Ничья!"
+    else:
+        game["turn"] = "O" if mark == "X" else "X"
+    await _refresh_pvp_game(game_id)
+    await callback.answer()
+
+
+@dp.callback_query(lambda c: c.data.startswith("pvp_chk:"))
+async def pvp_checkers_move(callback: CallbackQuery):
+    try:
+        _, game_id, row_text, col_text = callback.data.split(":")
+        r, c = int(row_text), int(col_text)
+        game = active_games[game_id]
+    except (ValueError, KeyError):
+        await callback.answer("Игра не найдена.", show_alert=True)
+        return
+    if callback.message.chat.type != "private" or game["type"] != "chk":
+        await callback.answer("Игра доступна только в личном чате.", show_alert=True)
+        return
+    side = game["turn"]
+    if game["finished"] or game["players"][side] != callback.from_user.id:
+        await callback.answer("Сейчас ход соперника.")
+        return
+    if not (0 <= r < 8 and 0 <= c < 8):
+        await callback.answer("Некорректная клетка.", show_alert=True)
+        return
+    board = game["board"]
+    selected = game["selected"] if game["selected_by"] == callback.from_user.id else None
+    if selected is None:
+        if board[r][c] and board[r][c].lower() == side:
+            game["selected"], game["selected_by"] = (r, c), callback.from_user.id
+            await _refresh_pvp_game(game_id)
+            await callback.answer("Выбери клетку назначения.")
+        else:
+            await callback.answer("Выбери свою шашку.")
+        return
+    move = next((m for m in _checkers_moves(board, side) if m[:2] == selected and m[2:] == (r, c)), None)
+    if move is None:
+        if board[r][c] and board[r][c].lower() == side:
+            game["selected"], game["selected_by"] = (r, c), callback.from_user.id
+            await _refresh_pvp_game(game_id)
+            await callback.answer("Выбрана другая шашка.")
+        else:
+            await callback.answer("Так ходить нельзя.")
+        return
+    _checkers_apply(board, move)
+    game["selected"], game["selected_by"] = None, None
+    game["turn"] = "b" if side == "w" else "w"
+    winner, finished = _checkers_over(board, game["turn"])
+    if finished:
+        game["finished"], game["status"] = True, winner
+    await _refresh_pvp_game(game_id)
+    await callback.answer()
+
+
+# =========================================================
+# QR CODE GENERATOR
 
 @dp.message(F.chat.type == "private", F.text & ~F.text.startswith("/"))
 async def qr_message_handler(
@@ -4144,6 +4557,14 @@ async def qr_message_handler(
 async def menu_command(
     message: types.Message
 ):
+
+    parts = (message.text or "").split(maxsplit=1)
+    command = parts[0].split("@", 1)[0].lower() if parts else ""
+    if command == "/start" and len(parts) > 1 and parts[1].startswith("game_"):
+        if message.chat.type != "private":
+            return
+        await accept_game_invite(message, parts[1][5:])
+        return
 
     if message.chat.type in ("group", "supergroup"):
         save_group_chat(
@@ -5216,20 +5637,50 @@ async def command_copy_help(
         "и фото профиля.\n\n"
         "Для того чтобы вернуть исходный профиль, .back \n\n"
     )
-
     await replace_menu(
         callback,
         text,
         InlineKeyboardMarkup(
             inline_keyboard=[
-                [
-                    InlineKeyboardButton(
-                        text="⬅️ К командам",
-                        callback_data="open_commands"
-                    )
-                ]
+                [InlineKeyboardButton(
+                    text="⬅️ К командам",
+                    callback_data="open_commands"
+                )]
             ]
         )
+    )
+
+
+@dp.callback_query(lambda c: c.data == "command_flip_dice")
+async def command_flip_dice_help(callback: CallbackQuery):
+    await replace_menu(
+        callback,
+        "🪙 <b>.flip</b> — подбросить монетку\n"
+        "🎲 <b>.dice</b> — бросить кубик.\n\n"
+        "Работает в личном чате с ботом.",
+        back_keyboard()
+    )
+
+
+@dp.callback_query(lambda c: c.data == "command_games")
+async def command_games_help(callback: CallbackQuery):
+    await replace_menu(
+        callback,
+        "♟ <b>.chk</b> — пригласить игрока в шашки\n"
+        "⭕ <b>.ttt</b> — пригласить игрока в крестики-нолики.\n\n"
+        "Отправь команду боту в личке и перешли ссылку сопернику. Он должен открыть её и нажать Start. После этого доска появится в личных чатах у обоих игроков.",
+        back_keyboard()
+    )
+
+
+@dp.callback_query(lambda c: c.data == "command_mute")
+async def command_mute_help(callback: CallbackQuery):
+    await replace_menu(
+        callback,
+        "🔇 <b>.mute</b> — приостановить архивирование Business-чата\n"
+        "🔊 <b>.unmute</b> — возобновить архивирование.\n\n"
+        "Отправь команду в личном Business-диалоге от своего аккаунта. Это отключает обработку сообщений ботом в этом чате, но не ограничивает собеседника в Telegram. В группах команды не работают.",
+        back_keyboard()
     )
 
 
@@ -6042,6 +6493,8 @@ async def group_message_handler(message: types.Message):
         command_parts = message_text.split(maxsplit=1)
         command = command_parts[0].split("@", 1)[0].lower()
         args = command_parts[1] if len(command_parts) > 1 else ""
+        if command in {".flip", ".dice", ".ttt", ".chk", ".mute", ".unmute"}:
+            return
         if await handle_group_spam_command(message, command, args):
             return
 
