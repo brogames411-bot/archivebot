@@ -790,6 +790,18 @@ def main_keyboard(user_id=None):
     )
 
 
+def back_keyboard(callback_data="open_menu", text="⬅️ Назад"):
+    """Build a one-button navigation keyboard for menu pages."""
+    return InlineKeyboardMarkup(
+        inline_keyboard=[[
+            InlineKeyboardButton(
+                text=text,
+                callback_data=callback_data
+            )
+        ]]
+    )
+
+
 # =========================================================
 # COMMANDS KEYBOARD
 # =========================================================
@@ -5658,7 +5670,7 @@ async def command_flip_dice_help(callback: CallbackQuery):
         "🪙 <b>.flip</b> — подбросить монетку\n"
         "🎲 <b>.dice</b> — бросить кубик.\n\n"
         "Работает в личном чате с ботом.",
-        back_keyboard()
+        back_keyboard("open_commands", "⬅️ К командам")
     )
 
 
@@ -5669,7 +5681,7 @@ async def command_games_help(callback: CallbackQuery):
         "♟ <b>.chk</b> — пригласить игрока в шашки\n"
         "⭕ <b>.ttt</b> — пригласить игрока в крестики-нолики.\n\n"
         "Отправь команду боту в личке и перешли ссылку сопернику. Он должен открыть её и нажать Start. После этого доска появится в личных чатах у обоих игроков.",
-        back_keyboard()
+        back_keyboard("open_commands", "⬅️ К командам")
     )
 
 
@@ -5680,7 +5692,7 @@ async def command_mute_help(callback: CallbackQuery):
         "🔇 <b>.mute</b> — приостановить архивирование Business-чата\n"
         "🔊 <b>.unmute</b> — возобновить архивирование.\n\n"
         "Отправь команду в личном Business-диалоге от своего аккаунта. Это отключает обработку сообщений ботом в этом чате, но не ограничивает собеседника в Telegram. В группах команды не работают.",
-        back_keyboard()
+        back_keyboard("open_commands", "⬅️ К командам")
     )
 
 
