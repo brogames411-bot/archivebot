@@ -36,7 +36,7 @@ from aiogram.exceptions import TelegramBadRequest, TelegramNetworkError
 TOKEN = os.getenv("BOT_TOKEN", "").strip()
 FFMPEG_PATH = os.getenv("FFMPEG_PATH", "ffmpeg").strip()
 
-SUPPORT_URL = "https://t.me/your_support"
+SUPPORT_URL = "https://t.me/armgg077"
 PREMIUM_URL = "https://t.me/your_premium"
 
 
@@ -317,6 +317,34 @@ CREATE TABLE IF NOT EXISTS payment_orders (
 )
 """)
 
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS archive_delivery_claims (
+    connection_id TEXT NOT NULL,
+    business_chat_id INTEGER NOT NULL,
+    source_message_id INTEGER NOT NULL,
+    recipient_id INTEGER NOT NULL,
+    trigger_type TEXT NOT NULL,
+    trigger_message_id INTEGER NOT NULL,
+    status TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY(
+        connection_id, business_chat_id, source_message_id,
+        recipient_id, trigger_type, trigger_message_id
+    )
+)
+""")
+
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS subscription_reminders (
+    user_id INTEGER NOT NULL,
+    expires_at TEXT NOT NULL,
+    status TEXT NOT NULL,
+    attempted_at TEXT NOT NULL,
+    sent_at TEXT,
+    PRIMARY KEY(user_id, expires_at)
+)
+""")
+
 
 # =========================================================
 # SPAM
@@ -358,6 +386,170 @@ db.commit()
 # =========================================================
 # PROFILE BACKUP
 # =========================================================
+
+def claim_archive_delivery(
+    connection_id,
+    business_chat_id,
+    source_message_id,
+    recipient_id,
+    trigger_type,
+    trigger_message_id
+):
+    """Reserve this trigger and suppress its paired delete/reply notification."""
+    now = datetime.now(timezone.utc)
+    now_text = now.isoformat()
+    key = (
+        connection_id, business_chat_id, source_message_id, recipient_id,
+        trigger_type, trigger_message_id
+    )
+    row = cursor.execute("""
+        SELECT status, updated_at FROM archive_delivery_claims
+        WHERE connection_id = ?
+          AND business_chat_id = ?
+          AND source_message_id = ?
+          AND recipient_id = ?
+          AND trigger_type = ?
+          AND trigger_message_id = ?
+    """, key).fetchone()
+
+    if row and row[0] == "sent":
+        return False
+    if row and row[0] == "sending":
+        try:
+            previous_update = datetime.fromisoformat(row[1])
+            if previous_update.tzinfo is None:
+                previous_update = previous_update.replace(tzinfo=timezone.utc)
+            if now - previous_update < timedelta(minutes=10):
+                return False
+        except (TypeError, ValueError):
+            return False
+
+    cross_event = cursor.execute("""
+        SELECT status, updated_at FROM archive_delivery_claims
+        WHERE connection_id = ?
+          AND business_chat_id = ?
+          AND source_message_id = ?
+          AND recipient_id = ?
+          AND trigger_type != ?
+        ORDER BY updated_at DESC
+        LIMIT 1
+    """, (connection_id, business_chat_id, source_message_id, recipient_id, trigger_type)).fetchone()
+    if cross_event and cross_event[0] in {"sending", "sent"}:
+        try:
+            cross_time = datetime.fromisoformat(cross_event[1])
+            if cross_time.tzinfo is None:
+                cross_time = cross_time.replace(tzinfo=timezone.utc)
+            if now - cross_time < timedelta(minutes=5):
+                return False
+        except (TypeError, ValueError):
+            return False
+
+    if row:
+        cursor.execute("""
+            UPDATE archive_delivery_claims
+            SET status = 'sending', updated_at = ?
+            WHERE connection_id = ?
+              AND business_chat_id = ?
+              AND source_message_id = ?
+              AND recipient_id = ?
+              AND trigger_type = ?
+              AND trigger_message_id = ?
+        """, (now_text, *key))
+    else:
+        cursor.execute("""
+            INSERT INTO archive_delivery_claims (
+                connection_id, business_chat_id, source_message_id,
+                recipient_id, trigger_type, trigger_message_id, status, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, 'sending', ?)
+        """, (*key, now_text))
+
+    db.commit()
+    return True
+
+
+async def wait_for_archive_delivery(
+    connection_id,
+    business_chat_id,
+    source_message_id,
+    recipient_id,
+    trigger_type,
+    trigger_message_id
+):
+    """Wait for this or its paired event's in-flight send to finish."""
+    for _ in range(300):
+        row = cursor.execute("""
+            SELECT status FROM archive_delivery_claims
+            WHERE connection_id = ?
+              AND business_chat_id = ?
+              AND source_message_id = ?
+              AND recipient_id = ?
+              AND trigger_type = ?
+              AND trigger_message_id = ?
+        """, (
+            connection_id, business_chat_id, source_message_id, recipient_id,
+            trigger_type, trigger_message_id
+        )).fetchone()
+        if row and row[0] == "sent":
+            return True
+        if row and row[0] == "failed":
+            return False
+
+        cross_event = cursor.execute("""
+            SELECT status, updated_at FROM archive_delivery_claims
+            WHERE connection_id = ?
+              AND business_chat_id = ?
+              AND source_message_id = ?
+              AND recipient_id = ?
+              AND trigger_type != ?
+            ORDER BY updated_at DESC
+            LIMIT 1
+        """, (connection_id, business_chat_id, source_message_id, recipient_id, trigger_type)).fetchone()
+        if cross_event:
+            if cross_event[0] == "sent":
+                cross_time = datetime.fromisoformat(cross_event[1])
+                if cross_time.tzinfo is None:
+                    cross_time = cross_time.replace(tzinfo=timezone.utc)
+                if datetime.now(timezone.utc) - cross_time < timedelta(minutes=5):
+                    return True
+                return False
+            if cross_event[0] == "failed":
+                return False
+        elif not row:
+            return False
+
+        await asyncio.sleep(0.1)
+    return None
+
+
+def finish_archive_delivery(
+    connection_id,
+    business_chat_id,
+    source_message_id,
+    recipient_id,
+    trigger_type,
+    trigger_message_id,
+    sent
+):
+    cursor.execute("""
+        UPDATE archive_delivery_claims
+        SET status = ?, updated_at = ?
+        WHERE connection_id = ?
+          AND business_chat_id = ?
+          AND source_message_id = ?
+          AND recipient_id = ?
+          AND trigger_type = ?
+          AND trigger_message_id = ?
+    """, (
+        "sent" if sent else "failed",
+        datetime.now(timezone.utc).isoformat(),
+        connection_id,
+        business_chat_id,
+        source_message_id,
+        recipient_id,
+        trigger_type,
+        trigger_message_id
+    ))
+    db.commit()
 
 cursor.execute("""
 CREATE TABLE IF NOT EXISTS profile_backup (
@@ -564,6 +756,120 @@ def subscription_keyboard(user_id):
         rows.append([InlineKeyboardButton(text=label, callback_data="buy_subscription")])
     rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="open_menu")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def russian_days_word(days):
+    last_two = days % 100
+    last = days % 10
+    if 11 <= last_two <= 14:
+        return "дней"
+    if last == 1:
+        return "день"
+    if 2 <= last <= 4:
+        return "дня"
+    return "дней"
+
+
+async def subscription_expiry_reminder_loop():
+    """Sends one persistent reminder when a paid subscription has <= 3 days left."""
+    while True:
+        now = datetime.now(timezone.utc)
+        subscriptions = cursor.execute(
+            "SELECT user_id, expires_at FROM subscriptions"
+        ).fetchall()
+
+        for user_id, expires_at_text in subscriptions:
+            if is_free_user(user_id):
+                continue
+            try:
+                expires_at = datetime.fromisoformat(expires_at_text)
+                if expires_at.tzinfo is None:
+                    expires_at = expires_at.replace(tzinfo=timezone.utc)
+            except (TypeError, ValueError):
+                logger.exception("Invalid subscription expiry stored: user_id=%s", user_id)
+                continue
+
+            remaining_seconds = (expires_at - now).total_seconds()
+            if remaining_seconds <= 0 or remaining_seconds > timedelta(days=3).total_seconds():
+                continue
+
+            reminder = cursor.execute("""
+                SELECT status, attempted_at FROM subscription_reminders
+                WHERE user_id = ? AND expires_at = ?
+            """, (user_id, expires_at_text)).fetchone()
+            if reminder and reminder[0] == "sent":
+                continue
+            if reminder and reminder[0] == "sending":
+                try:
+                    attempted_at = datetime.fromisoformat(reminder[1])
+                    if attempted_at.tzinfo is None:
+                        attempted_at = attempted_at.replace(tzinfo=timezone.utc)
+                    if now - attempted_at < timedelta(minutes=10):
+                        continue
+                except (TypeError, ValueError):
+                    pass
+
+            attempted_at = now.isoformat()
+            cursor.execute("""
+                INSERT INTO subscription_reminders (
+                    user_id, expires_at, status, attempted_at, sent_at
+                ) VALUES (?, ?, 'sending', ?, NULL)
+                ON CONFLICT(user_id, expires_at) DO UPDATE SET
+                    status = 'sending',
+                    attempted_at = excluded.attempted_at,
+                    sent_at = NULL
+            """, (user_id, expires_at_text, attempted_at))
+            db.commit()
+
+            days_left = max(1, int((remaining_seconds + 86399) // 86400))
+            reminder_text = (
+                "⏰ <b>Напоминание о подписке</b>\n\n"
+                f"Подписка истечёт примерно через <b>{days_left} "
+                f"{russian_days_word(days_left)}</b> — "
+                f"{safe(expires_at.strftime('%d.%m.%Y %H:%M UTC'))}.\n"
+                "Продли доступ кнопкой ниже или командой /subscription."
+            )
+
+            try:
+                await bot.send_message(
+                    chat_id=user_id,
+                    text=reminder_text,
+                    parse_mode="HTML",
+                    reply_markup=subscription_keyboard(user_id)
+                )
+            except Exception:
+                cursor.execute("""
+                    UPDATE subscription_reminders
+                    SET status = 'failed'
+                    WHERE user_id = ? AND expires_at = ?
+                """, (user_id, expires_at_text))
+                db.commit()
+                logger.exception("Could not send subscription expiry reminder: user_id=%s", user_id)
+            else:
+                cursor.execute("""
+                    UPDATE subscription_reminders
+                    SET status = 'sent', sent_at = ?
+                    WHERE user_id = ? AND expires_at = ?
+                """, (datetime.now(timezone.utc).isoformat(), user_id, expires_at_text))
+                db.commit()
+                logger.info(
+                    "Subscription expiry reminder sent: user_id=%s expires_at=%s",
+                    user_id,
+                    expires_at_text
+                )
+
+        await asyncio.sleep(60 * 60)
+
+
+async def subscription_expiry_reminder_supervisor():
+    while True:
+        try:
+            await subscription_expiry_reminder_loop()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Subscription reminder loop stopped unexpectedly; restarting in 60 seconds")
+            await asyncio.sleep(60)
 
 
 async def notify_subscription_required(user_id):
@@ -939,12 +1245,6 @@ def main_keyboard(user_id=None):
             )
         ],
 
-        [
-            InlineKeyboardButton(
-                text="💎 Business Premium ↗",
-                url=PREMIUM_URL
-            )
-        ],
 
         [
             InlineKeyboardButton(
@@ -1911,10 +2211,67 @@ async def forward_replied_message_to_replier(message: types.Message) -> bool:
         type(reply).__name__
     )
 
+    source_media_message_id = getattr(reply, "message_id", None)
+    recipient_id = reply_archive_recipient_id(message)
+    delivery_claimed = False
+    reply_message_id = getattr(message, "message_id", None)
+    if (
+        source_media_message_id is not None
+        and recipient_id is not None
+        and reply_message_id is not None
+    ):
+        delivery_claimed = claim_archive_delivery(
+            message.business_connection_id,
+            message.chat.id,
+            source_media_message_id,
+            recipient_id,
+            "reply",
+            reply_message_id
+        )
+        if not delivery_claimed:
+            already_delivered = await wait_for_archive_delivery(
+                message.business_connection_id,
+                message.chat.id,
+                source_media_message_id,
+                recipient_id,
+                "reply",
+                reply_message_id
+            )
+            if already_delivered is not False:
+                logger.info(
+                    "Duplicate archive delivery skipped: connection_id=%s chat_id=%s "
+                    "source_message_id=%s recipient_id=%s",
+                    message.business_connection_id,
+                    message.chat.id,
+                    source_media_message_id,
+                    recipient_id
+                )
+                return True
+            delivery_claimed = claim_archive_delivery(
+                message.business_connection_id,
+                message.chat.id,
+                source_media_message_id,
+                recipient_id,
+                "reply",
+                reply_message_id
+            )
+            if not delivery_claimed:
+                return True
+
     sent = await send_replied_message_to_replier(
         source_message=message,
         reply=reply
     )
+    if delivery_claimed:
+        finish_archive_delivery(
+            message.business_connection_id,
+            message.chat.id,
+            source_media_message_id,
+            recipient_id,
+            "reply",
+            reply_message_id,
+            sent
+        )
 
     if sent:
         logger.info(
@@ -3912,6 +4269,42 @@ async def deleted_business_messages_handler(
             )
             continue
 
+        if not claim_archive_delivery(
+            event.business_connection_id,
+            event.chat.id,
+            message_id,
+            user_chat_id,
+            "deleted",
+            message_id
+        ):
+            already_delivered = await wait_for_archive_delivery(
+                event.business_connection_id,
+                event.chat.id,
+                message_id,
+                user_chat_id,
+                "deleted",
+                message_id
+            )
+            if already_delivered is not False:
+                logger.info(
+                    "Duplicate deletion delivery skipped: connection_id=%s chat_id=%s "
+                    "message_id=%s recipient_id=%s",
+                    event.business_connection_id,
+                    event.chat.id,
+                    message_id,
+                    user_chat_id
+                )
+                continue
+            if not claim_archive_delivery(
+                event.business_connection_id,
+                event.chat.id,
+                message_id,
+                user_chat_id,
+                "deleted",
+                message_id
+            ):
+                continue
+
         name, username_text = get_user_name(
             first_name,
             last_name,
@@ -3952,6 +4345,7 @@ async def deleted_business_messages_handler(
 
         if media_type == "text" or not file_id:
 
+            delivered = False
             try:
                 await bot.send_message(
                     chat_id=user_chat_id,
@@ -3965,9 +4359,20 @@ async def deleted_business_messages_handler(
                     ),
                     parse_mode="HTML"
                 )
+                delivered = True
 
             except Exception as error:
                 logger.error('%s %s', "❌ DELETE NOTIFY ERROR:", repr(error))
+            finally:
+                finish_archive_delivery(
+                    event.business_connection_id,
+                    event.chat.id,
+                    message_id,
+                    user_chat_id,
+                    "deleted",
+                    message_id,
+                    delivered
+                )
 
             continue
 
@@ -3982,6 +4387,7 @@ async def deleted_business_messages_handler(
             f"{safe(text or '—')}"
         )
 
+        delivered = False
         try:
 
             if media_type == "photo":
@@ -4098,9 +4504,21 @@ async def deleted_business_messages_handler(
                         parse_mode="HTML"
                     )
 
+            delivered = True
+
         except Exception as error:
 
             logger.error('%s %s', "❌ MEDIA DELETE ERROR:", repr(error))
+        finally:
+            finish_archive_delivery(
+                event.business_connection_id,
+                event.chat.id,
+                message_id,
+                user_chat_id,
+                "deleted",
+                message_id,
+                delivered
+            )
 # =========================================================
 # GROUP CHAT SUPPORT
 # =========================================================
@@ -5169,7 +5587,24 @@ async def admin_grant_free_access(message: types.Message):
     db.commit()
     subscription_notice_sent.discard(user_id)
     logger.info("Free access granted: user_id=%s admin_id=%s", user_id, message.from_user.id)
-    await message.answer(f"✅ Пользователю <code>{user_id}</code> выдан бесплатный доступ.", parse_mode="HTML")
+    try:
+        await bot.send_message(
+            chat_id=user_id,
+            text=(
+                "🎁 Вам выдали бесплатный доступ к ArchiveBot.\n\n"
+                "Архивирование уже включено. Проверить статус можно командой /subscription."
+            ),
+            reply_markup=subscription_keyboard(user_id)
+        )
+        user_notified = True
+    except Exception:
+        user_notified = False
+        logger.exception("Could not notify user about free access: user_id=%s", user_id)
+
+    admin_response = f"✅ Пользователю <code>{user_id}</code> выдан бесплатный доступ."
+    if not user_notified:
+        admin_response += "\nНе удалось написать пользователю: пусть он сначала откроет бота и нажмёт Start."
+    await message.answer(admin_response, parse_mode="HTML")
 
 
 @dp.message(Command("revokefree"), F.chat.type == "private")
@@ -7317,6 +7752,7 @@ async def main():
     # START POLLING
     # =====================================================
 
+    reminder_task = asyncio.create_task(subscription_expiry_reminder_supervisor())
 
     logger.info('📡 Запускаю polling...')
 
@@ -7338,6 +7774,13 @@ async def main():
     except Exception as error:
 
         logger.exception("Polling остановился из-за ошибки")
+
+    finally:
+        reminder_task.cancel()
+        try:
+            await reminder_task
+        except asyncio.CancelledError:
+            pass
 
 
 
