@@ -35,8 +35,8 @@ from aiogram.exceptions import TelegramBadRequest, TelegramNetworkError
 TOKEN = os.getenv("BOT_TOKEN", "").strip()
 FFMPEG_PATH = os.getenv("FFMPEG_PATH", "ffmpeg").strip()
 
-SUPPORT_URL = "https://t.me/your_support"
-PREMIUM_URL = "https://t.me/your_premium"
+SUPPORT_URL = "https://t.me/armgg077"
+
 
 
 
@@ -766,13 +766,6 @@ def main_keyboard(user_id=None):
             InlineKeyboardButton(
                 text="⚙️ Настройки",
                 callback_data="open_settings"
-            )
-        ],
-
-        [
-            InlineKeyboardButton(
-                text="💎 Business Premium ↗",
-                url=PREMIUM_URL
             )
         ],
 
