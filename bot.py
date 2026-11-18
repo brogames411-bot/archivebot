@@ -1923,8 +1923,10 @@ async def forward_replied_message_to_replier(message: types.Message) -> bool:
 
 
 def is_media_message(message) -> bool:
-    """True when the replied-to Telegram message contains supported media."""
+    """True for reply media we return; stickers are intentionally ignored."""
     if not message:
+        return False
+    if getattr(message, "sticker", None):
         return False
     media_type, file_id = get_media_info(message)
     return media_type != "text" and bool(file_id)
@@ -3775,6 +3777,16 @@ async def edited_business_message_handler(
 
     db.commit()
 
+    if user_id == owner_id:
+        logger.debug(
+            "Owner's edited Business message archived without notification: "
+            "connection_id=%s chat_id=%s message_id=%s",
+            message.business_connection_id,
+            message.chat.id,
+            message.message_id
+        )
+        return
+
     if not edit_notifications:
         return
 
@@ -3883,6 +3895,16 @@ async def deleted_business_messages_handler(
         ))
 
         db.commit()
+
+        if user_id == owner_id:
+            logger.debug(
+                "Owner's deleted Business message archived without notification: "
+                "connection_id=%s chat_id=%s message_id=%s",
+                event.business_connection_id,
+                event.chat.id,
+                message_id
+            )
+            continue
 
         name, username_text = get_user_name(
             first_name,
