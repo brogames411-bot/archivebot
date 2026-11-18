@@ -1333,17 +1333,24 @@ def reply_archive_recipient_id(source_message):
         return None
     if not getattr(source_message, "business_connection_id", None):
         return None
-    # BusinessMessage.chat.id — личный чат того, кто прислал ответ.
-    return source_message.chat.id
+    # Отправляем в личный диалог автора ответа с ботом, не через Business.
+    replier_id = getattr(getattr(source_message, "from_user", None), "id", None)
+    if not replier_id:
+        logger.warning(
+            "Cannot identify Business reply author; skip Bot DM: chat_id=%s message_id=%s",
+            source_message.chat.id,
+            getattr(source_message, "message_id", None)
+        )
+        return None
+    return replier_id
 
 
-async def send_photo_to_chat(chat_id, photo_file_id, caption, business_connection_id=None):
+async def send_photo_to_chat(chat_id, photo_file_id, caption):
     """Пытается переслать фото по file_id, а self-destructing фото перезагружает."""
 
     try:
         await bot.send_photo(
             chat_id=chat_id,
-            business_connection_id=business_connection_id,
             photo=photo_file_id,
             caption=caption,
             parse_mode="HTML"
@@ -1375,7 +1382,6 @@ async def send_photo_to_chat(chat_id, photo_file_id, caption, business_connectio
 
     await bot.send_photo(
         chat_id=chat_id,
-        business_connection_id=business_connection_id,
         photo=BufferedInputFile(photo_bytes, filename="saved_photo.jpg"),
         caption=caption,
         parse_mode="HTML"
@@ -1386,7 +1392,11 @@ async def send_replied_message_to_replier(
     source_message: types.Message,
     reply: types.Message
 ) -> bool:
-    """Отправляет сохранённое медиа автору ответа в исходный Business-чат."""
+    """Отправляет сохранённое медиа автору ответа в его личный чат с ботом."""
+
+    if getattr(reply, "sticker", None):
+        logger.debug("Sticker reply source skipped: chat_id=%s", source_message.chat.id)
+        return False
 
     recipient_id = reply_archive_recipient_id(source_message)
     if not recipient_id:
@@ -1438,7 +1448,6 @@ async def send_replied_message_to_replier(
 
             await send_photo_to_chat(
                 chat_id=recipient_id,
-                business_connection_id=connection_id,
                 photo_file_id=reply.photo[-1].file_id,
                 caption=(
                     header +
@@ -1459,7 +1468,6 @@ async def send_replied_message_to_replier(
 
             await bot.send_video(
                 chat_id=recipient_id,
-                business_connection_id=connection_id,
                 video=reply.video.file_id,
                 caption=(
                     header +
@@ -1481,7 +1489,6 @@ async def send_replied_message_to_replier(
 
             await bot.send_document(
                 chat_id=recipient_id,
-                business_connection_id=connection_id,
                 document=reply.document.file_id,
                 caption=(
                     header +
@@ -1503,7 +1510,6 @@ async def send_replied_message_to_replier(
 
             await bot.send_audio(
                 chat_id=recipient_id,
-                business_connection_id=connection_id,
                 audio=reply.audio.file_id,
                 caption=(
                     header +
@@ -1525,7 +1531,6 @@ async def send_replied_message_to_replier(
 
             await bot.send_voice(
                 chat_id=recipient_id,
-                business_connection_id=connection_id,
                 voice=reply.voice.file_id,
                 caption=(
                     header +
@@ -1547,14 +1552,12 @@ async def send_replied_message_to_replier(
 
             await bot.send_message(
                 chat_id=recipient_id,
-                business_connection_id=connection_id,
                 text=header + "\n🎬 <b>Тип:</b> Кружок",
                 parse_mode="HTML"
             )
 
             await bot.send_video_note(
                 chat_id=recipient_id,
-                business_connection_id=connection_id,
                 video_note=reply.video_note.file_id
             )
 
@@ -1568,7 +1571,6 @@ async def send_replied_message_to_replier(
 
             await bot.send_animation(
                 chat_id=recipient_id,
-                business_connection_id=connection_id,
                 animation=reply.animation.file_id,
                 caption=(
                     header +
@@ -1590,14 +1592,12 @@ async def send_replied_message_to_replier(
 
             await bot.send_message(
                 chat_id=recipient_id,
-                business_connection_id=connection_id,
                 text=header + "\n🧩 <b>Тип:</b> Стикер",
                 parse_mode="HTML"
             )
 
             await bot.send_sticker(
                 chat_id=recipient_id,
-                business_connection_id=connection_id,
                 sticker=reply.sticker.file_id
             )
 
@@ -1611,7 +1611,6 @@ async def send_replied_message_to_replier(
 
             await bot.send_message(
                 chat_id=recipient_id,
-                business_connection_id=connection_id,
                 text=(
                     header +
                     "\n💬 <b>Текст:</b>\n"
@@ -1628,7 +1627,6 @@ async def send_replied_message_to_replier(
 
         await bot.send_message(
             chat_id=recipient_id,
-            business_connection_id=connection_id,
             text=(
                 header +
                 "\n⚠️ <b>Неизвестный тип сообщения.</b>"
@@ -1639,13 +1637,16 @@ async def send_replied_message_to_replier(
 
     except Exception as error:
 
-        logger.exception("Не удалось вернуть архивное сообщение автору ответа")
+        logger.exception(
+            "Не удалось отправить архивное сообщение в личный чат бота: "
+            "replier_id=%s. Возможно, пользователь ещё не нажал Start.",
+            recipient_id
+        )
 
         try:
 
             await bot.send_message(
                 chat_id=recipient_id,
-                business_connection_id=connection_id,
                 text=(
                     "❌ <b>Ошибка пересылки сообщения</b>\n\n"
                     f"<code>{safe(error)}</code>"
@@ -1654,7 +1655,7 @@ async def send_replied_message_to_replier(
             )
 
         except Exception:
-            logger.exception("Не удалось уведомить владельца Business об ошибке пересылки")
+            logger.exception("Не удалось отправить сообщение об ошибке в личный чат бота")
 
         return False
 
@@ -1768,7 +1769,7 @@ def find_archived_message_for_quote(source_message, quote):
 
 
 async def send_quote_to_replier(source_message, quote_text, ambiguous=False):
-    """Отправляет автору ответа цитату, если исходник найти не удалось."""
+    """Отправляет автору ответа цитату в личный чат с ботом."""
 
     recipient_id = reply_archive_recipient_id(source_message)
     if not recipient_id:
@@ -1784,7 +1785,6 @@ async def send_quote_to_replier(source_message, quote_text, ambiguous=False):
 
     await bot.send_message(
         chat_id=recipient_id,
-        business_connection_id=source_message.business_connection_id,
         text=(
             "💾 <b>ЦИТАТА ИЗ ОТВЕТА</b>\n\n"
             f"💬 <b>Chat ID:</b> <code>{source_message.chat.id}</code>\n"
@@ -1856,10 +1856,10 @@ async def cancel_qr(
         "Создание QR отменено."
     )
 async def forward_replied_message_to_replier(message: types.Message) -> bool:
-    """Возвращает автору ответа медиа в том же личном Business-чате."""
+    """Отправляет автору ответа медиа в его личный чат с ботом."""
 
     if not reply_archive_recipient_id(message):
-        logger.error("Business reply recipient unavailable: chat_id=%s", message.chat.id)
+        logger.error("Reply author Bot chat unavailable: business_chat_id=%s", message.chat.id)
         return False
 
     reply = message.reply_to_message or getattr(message, "external_reply", None)
@@ -1888,7 +1888,10 @@ async def forward_replied_message_to_replier(message: types.Message) -> bool:
                 quote_text=quote_text,
                 ambiguous=ambiguous
             )
-            logger.info("Reply quote sent to reply author: chat_id=%s", message.chat.id)
+            logger.info(
+                "Reply quote sent to author in Bot DM: user_id=%s",
+                getattr(message.from_user, "id", None) or message.chat.id
+            )
             return True
         else:
             logger.warning(
@@ -1897,6 +1900,9 @@ async def forward_replied_message_to_replier(message: types.Message) -> bool:
                 message.message_id
             )
             return False
+
+    if not is_media_message(reply):
+        return False
 
     logger.debug(
         "Reply source selected: chat_id=%s message_id=%s type=%s",
@@ -1912,8 +1918,8 @@ async def forward_replied_message_to_replier(message: types.Message) -> bool:
 
     if sent:
         logger.info(
-            "Reply source returned to reply author: chat_id=%s source_message_id=%s",
-            message.chat.id,
+            "Reply source sent to author in Bot DM: user_id=%s source_message_id=%s",
+            getattr(message.from_user, "id", None) or message.chat.id,
             getattr(reply, "message_id", None)
         )
     else:
