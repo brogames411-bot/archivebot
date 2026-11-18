@@ -142,6 +142,20 @@ if not 1 <= SUBSCRIPTION_PRICE_STARS <= 10000:
     logger.warning("SUBSCRIPTION_PRICE_STARS must be 1..10000; using 100 Stars")
     SUBSCRIPTION_PRICE_STARS = 100
 
+FREE_USER_IDS = set()
+for _free_user_id in os.getenv("FREE_USER_IDS", "").split(","):
+    _free_user_id = _free_user_id.strip()
+    if not _free_user_id:
+        continue
+    try:
+        parsed_free_user_id = int(_free_user_id)
+        if parsed_free_user_id > 0:
+            FREE_USER_IDS.add(parsed_free_user_id)
+        else:
+            logger.warning("Ignoring invalid FREE_USER_IDS entry: %r", _free_user_id)
+    except ValueError:
+        logger.warning("Ignoring invalid FREE_USER_IDS entry: %r", _free_user_id)
+
 DB_PATH = os.path.join(DATA_DIR, "business_archive.db")
 
 db = sqlite3.connect(
@@ -279,6 +293,14 @@ CREATE TABLE IF NOT EXISTS subscriptions (
     expires_at TEXT NOT NULL,
     last_charge_id TEXT,
     updated_at TEXT NOT NULL
+)
+""")
+
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS free_users (
+    user_id INTEGER PRIMARY KEY,
+    granted_by INTEGER NOT NULL,
+    granted_at TEXT NOT NULL
 )
 """)
 
@@ -479,10 +501,22 @@ def get_subscription_expiration(user_id):
 def is_subscription_active(user_id):
     if not user_id:
         return False
-    if ADMIN_ID and user_id == ADMIN_ID:
+    if is_free_user(user_id):
         return True
     expiration = get_subscription_expiration(user_id)
     return bool(expiration and expiration > datetime.now(timezone.utc))
+
+
+def is_free_user(user_id):
+    if not user_id:
+        return False
+    if (ADMIN_ID and user_id == ADMIN_ID) or user_id in FREE_USER_IDS:
+        return True
+    row = cursor.execute(
+        "SELECT 1 FROM free_users WHERE user_id = ?",
+        (user_id,)
+    ).fetchone()
+    return bool(row)
 
 
 def group_subscription_owner(chat_id):
@@ -494,8 +528,8 @@ def group_subscription_owner(chat_id):
 
 
 def subscription_status_text(user_id):
-    if ADMIN_ID and user_id == ADMIN_ID:
-        return "✅ У тебя бесплатный доступ администратора."
+    if is_free_user(user_id):
+        return "✅ Для этого аккаунта включён бесплатный доступ."
     expiration = get_subscription_expiration(user_id)
     if expiration and expiration > datetime.now(timezone.utc):
         return (
@@ -506,6 +540,13 @@ def subscription_status_text(user_id):
 
 
 def subscription_page_text(user_id):
+    if is_free_user(user_id):
+        return (
+            "⭐ <b>Подписка ArchiveBot</b>\n\n"
+            "✅ Для этого аккаунта включён бесплатный доступ.\n"
+            "Архивирование Business-переписки и подключённых групп активно.\n"
+            "Поддержка: /paysupport · Условия: /terms."
+        )
     return (
         "⭐ <b>Подписка ArchiveBot</b>\n\n"
         f"{subscription_status_text(user_id)}\n\n"
@@ -518,7 +559,7 @@ def subscription_page_text(user_id):
 
 def subscription_keyboard(user_id):
     rows = []
-    if not (ADMIN_ID and user_id == ADMIN_ID):
+    if not is_free_user(user_id):
         label = "🔄 Продлить на 30 дней" if is_subscription_active(user_id) else "⭐ Купить доступ на 30 дней"
         rows.append([InlineKeyboardButton(text=label, callback_data="buy_subscription")])
     rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="open_menu")])
@@ -1276,7 +1317,7 @@ async def business_connection_handler(
 
 # =========================================================
 # =========================================================
-# AUTO-ARCHIVE REPLIES — отправка сообщения из ответа владельцу Business
+# AUTO-ARCHIVE REPLIES — возврат медиа автору ответа
 # =========================================================
 
 # Укажи свой Telegram ID через переменную окружения ADMIN_ID.
@@ -1288,25 +1329,21 @@ ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 
 
 def reply_archive_recipient_id(source_message):
-    connection_id = getattr(source_message, "business_connection_id", None)
-    if not connection_id:
+    if getattr(getattr(source_message, "chat", None), "type", None) != "private":
         return None
-    row = cursor.execute(
-        "SELECT user_chat_id FROM business_connections WHERE connection_id = ?",
-        (connection_id,)
-    ).fetchone()
-    if row and row[0]:
-        return row[0]
-    logger.error("Business reply recipient not found: connection_id=%s", connection_id)
-    return None
+    if not getattr(source_message, "business_connection_id", None):
+        return None
+    # BusinessMessage.chat.id — личный чат того, кто прислал ответ.
+    return source_message.chat.id
 
 
-async def send_photo_to_chat(chat_id, photo_file_id, caption):
+async def send_photo_to_chat(chat_id, photo_file_id, caption, business_connection_id=None):
     """Пытается переслать фото по file_id, а self-destructing фото перезагружает."""
 
     try:
         await bot.send_photo(
             chat_id=chat_id,
+            business_connection_id=business_connection_id,
             photo=photo_file_id,
             caption=caption,
             parse_mode="HTML"
@@ -1338,34 +1375,28 @@ async def send_photo_to_chat(chat_id, photo_file_id, caption):
 
     await bot.send_photo(
         chat_id=chat_id,
+        business_connection_id=business_connection_id,
         photo=BufferedInputFile(photo_bytes, filename="saved_photo.jpg"),
         caption=caption,
         parse_mode="HTML"
     )
 
 
-async def send_replied_message_to_owner(
+async def send_replied_message_to_replier(
     source_message: types.Message,
     reply: types.Message
 ) -> bool:
-    """Отправляет сохранённое сообщение владельцу Business-подключения."""
+    """Отправляет сохранённое медиа автору ответа в исходный Business-чат."""
 
     recipient_id = reply_archive_recipient_id(source_message)
     if not recipient_id:
         logger.error(
-            "Reply archive recipient is unavailable: connection_id=%s",
+            "Reply author chat is unavailable: connection_id=%s",
             getattr(source_message, "business_connection_id", None)
         )
         return False
 
-    connection_id = (
-        source_message.business_connection_id
-        or (
-            group_connection_id(source_message.chat.id)
-            if getattr(source_message.chat, "type", None) in ("group", "supergroup")
-            else None
-        )
-    )
+    connection_id = source_message.business_connection_id
 
     sender = getattr(reply, "from_user", None)
     if sender is None:
@@ -1407,6 +1438,7 @@ async def send_replied_message_to_owner(
 
             await send_photo_to_chat(
                 chat_id=recipient_id,
+                business_connection_id=connection_id,
                 photo_file_id=reply.photo[-1].file_id,
                 caption=(
                     header +
@@ -1427,6 +1459,7 @@ async def send_replied_message_to_owner(
 
             await bot.send_video(
                 chat_id=recipient_id,
+                business_connection_id=connection_id,
                 video=reply.video.file_id,
                 caption=(
                     header +
@@ -1448,6 +1481,7 @@ async def send_replied_message_to_owner(
 
             await bot.send_document(
                 chat_id=recipient_id,
+                business_connection_id=connection_id,
                 document=reply.document.file_id,
                 caption=(
                     header +
@@ -1469,6 +1503,7 @@ async def send_replied_message_to_owner(
 
             await bot.send_audio(
                 chat_id=recipient_id,
+                business_connection_id=connection_id,
                 audio=reply.audio.file_id,
                 caption=(
                     header +
@@ -1490,6 +1525,7 @@ async def send_replied_message_to_owner(
 
             await bot.send_voice(
                 chat_id=recipient_id,
+                business_connection_id=connection_id,
                 voice=reply.voice.file_id,
                 caption=(
                     header +
@@ -1511,12 +1547,14 @@ async def send_replied_message_to_owner(
 
             await bot.send_message(
                 chat_id=recipient_id,
+                business_connection_id=connection_id,
                 text=header + "\n🎬 <b>Тип:</b> Кружок",
                 parse_mode="HTML"
             )
 
             await bot.send_video_note(
                 chat_id=recipient_id,
+                business_connection_id=connection_id,
                 video_note=reply.video_note.file_id
             )
 
@@ -1530,6 +1568,7 @@ async def send_replied_message_to_owner(
 
             await bot.send_animation(
                 chat_id=recipient_id,
+                business_connection_id=connection_id,
                 animation=reply.animation.file_id,
                 caption=(
                     header +
@@ -1551,12 +1590,14 @@ async def send_replied_message_to_owner(
 
             await bot.send_message(
                 chat_id=recipient_id,
+                business_connection_id=connection_id,
                 text=header + "\n🧩 <b>Тип:</b> Стикер",
                 parse_mode="HTML"
             )
 
             await bot.send_sticker(
                 chat_id=recipient_id,
+                business_connection_id=connection_id,
                 sticker=reply.sticker.file_id
             )
 
@@ -1570,6 +1611,7 @@ async def send_replied_message_to_owner(
 
             await bot.send_message(
                 chat_id=recipient_id,
+                business_connection_id=connection_id,
                 text=(
                     header +
                     "\n💬 <b>Текст:</b>\n"
@@ -1586,6 +1628,7 @@ async def send_replied_message_to_owner(
 
         await bot.send_message(
             chat_id=recipient_id,
+            business_connection_id=connection_id,
             text=(
                 header +
                 "\n⚠️ <b>Неизвестный тип сообщения.</b>"
@@ -1596,12 +1639,13 @@ async def send_replied_message_to_owner(
 
     except Exception as error:
 
-        logger.exception("Не удалось отправить архивное сообщение владельцу Business")
+        logger.exception("Не удалось вернуть архивное сообщение автору ответа")
 
         try:
 
             await bot.send_message(
                 chat_id=recipient_id,
+                business_connection_id=connection_id,
                 text=(
                     "❌ <b>Ошибка пересылки сообщения</b>\n\n"
                     f"<code>{safe(error)}</code>"
@@ -1723,8 +1767,8 @@ def find_archived_message_for_quote(source_message, quote):
     return None, len(matches) > 1
 
 
-async def send_quote_to_owner(source_message, quote_text, ambiguous=False):
-    """Отправляет владельцу Business цитату, если исходник найти не удалось."""
+async def send_quote_to_replier(source_message, quote_text, ambiguous=False):
+    """Отправляет автору ответа цитату, если исходник найти не удалось."""
 
     recipient_id = reply_archive_recipient_id(source_message)
     if not recipient_id:
@@ -1740,6 +1784,7 @@ async def send_quote_to_owner(source_message, quote_text, ambiguous=False):
 
     await bot.send_message(
         chat_id=recipient_id,
+        business_connection_id=source_message.business_connection_id,
         text=(
             "💾 <b>ЦИТАТА ИЗ ОТВЕТА</b>\n\n"
             f"💬 <b>Chat ID:</b> <code>{source_message.chat.id}</code>\n"
@@ -1810,8 +1855,8 @@ async def cancel_qr(
     await callback.answer(
         "Создание QR отменено."
     )
-async def forward_replied_message_to_owner(message: types.Message) -> bool:
-    """Отправляет владельцу Business медиа из сообщения, на которое ответили."""
+async def forward_replied_message_to_replier(message: types.Message) -> bool:
+    """Возвращает автору ответа медиа в том же личном Business-чате."""
 
     if not reply_archive_recipient_id(message):
         logger.error("Business reply recipient unavailable: chat_id=%s", message.chat.id)
@@ -1821,9 +1866,9 @@ async def forward_replied_message_to_owner(message: types.Message) -> bool:
     quote = getattr(message, "quote", None)
     quote_text = getattr(quote, "text", None) or ""
 
-    # Обрабатываем только ответы на медиа. Для текста и цитат без исходного
-    # сообщения отправка в архив не выполняется.
-    if reply is None or not is_media_message(reply):
+    # Обрабатываем только ответы на медиа. Если Telegram передал лишь цитату,
+    # пробуем восстановить исходное медиа из архива по её тексту.
+    if reply is not None and not is_media_message(reply):
         return False
 
     if reply is None:
@@ -1838,12 +1883,12 @@ async def forward_replied_message_to_owner(message: types.Message) -> bool:
                 chat_id=message.chat.id
             )
         elif quote_text:
-            await send_quote_to_owner(
+            await send_quote_to_replier(
                 source_message=message,
                 quote_text=quote_text,
                 ambiguous=ambiguous
             )
-            logger.info("Reply quote sent to Business owner: chat_id=%s", message.chat.id)
+            logger.info("Reply quote sent to reply author: chat_id=%s", message.chat.id)
             return True
         else:
             logger.warning(
@@ -1860,14 +1905,14 @@ async def forward_replied_message_to_owner(message: types.Message) -> bool:
         type(reply).__name__
     )
 
-    sent = await send_replied_message_to_owner(
+    sent = await send_replied_message_to_replier(
         source_message=message,
         reply=reply
     )
 
     if sent:
         logger.info(
-            "Reply source forwarded to Business owner: chat_id=%s source_message_id=%s",
+            "Reply source returned to reply author: chat_id=%s source_message_id=%s",
             message.chat.id,
             getattr(reply, "message_id", None)
         )
@@ -3546,7 +3591,7 @@ async def business_message_handler(
         or getattr(message, "quote", None)
     ):
         try:
-            await forward_replied_message_to_owner(message)
+            await forward_replied_message_to_replier(message)
         except Exception:
             logger.exception(
                 "Business reply media forwarding failed: chat_id=%s message_id=%s",
@@ -4769,8 +4814,8 @@ async def qr_message_handler(
 # =========================================================
 
 async def send_subscription_invoice(user_id, chat_id):
-    if ADMIN_ID and user_id == ADMIN_ID:
-        await bot.send_message(chat_id, "У тебя бесплатный доступ администратора.")
+    if is_free_user(user_id):
+        await bot.send_message(chat_id, "Для этого аккаунта уже включён бесплатный доступ.")
         return
 
     payload = f"archivebot_30d_{user_id}_{uuid.uuid4().hex}"
@@ -5068,6 +5113,93 @@ async def admin_refund_star_payment(message: types.Message):
     except Exception:
         logger.exception("Could not refund Stars payment: user_id=%s charge_id=%s", buyer_id, charge_id)
         await message.answer("Не удалось оформить возврат. Проверь charge_id и логи.")
+
+
+@dp.message(Command("grantfree"), F.chat.type == "private")
+async def admin_grant_free_access(message: types.Message):
+    if not ADMIN_ID or message.from_user.id != ADMIN_ID:
+        return
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) != 2:
+        await message.answer("Формат: /grantfree telegram_user_id")
+        return
+    try:
+        user_id = int(parts[1].strip())
+        if user_id <= 0:
+            raise ValueError
+    except ValueError:
+        await message.answer("Укажи положительный числовой Telegram ID пользователя.")
+        return
+
+    cursor.execute("""
+        INSERT INTO free_users (user_id, granted_by, granted_at)
+        VALUES (?, ?, ?)
+        ON CONFLICT(user_id) DO UPDATE SET
+            granted_by = excluded.granted_by,
+            granted_at = excluded.granted_at
+    """, (user_id, message.from_user.id, datetime.now(timezone.utc).isoformat()))
+    db.commit()
+    subscription_notice_sent.discard(user_id)
+    logger.info("Free access granted: user_id=%s admin_id=%s", user_id, message.from_user.id)
+    await message.answer(f"✅ Пользователю <code>{user_id}</code> выдан бесплатный доступ.", parse_mode="HTML")
+
+
+@dp.message(Command("revokefree"), F.chat.type == "private")
+async def admin_revoke_free_access(message: types.Message):
+    if not ADMIN_ID or message.from_user.id != ADMIN_ID:
+        return
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) != 2:
+        await message.answer("Формат: /revokefree telegram_user_id")
+        return
+    try:
+        user_id = int(parts[1].strip())
+        if user_id <= 0:
+            raise ValueError
+    except ValueError:
+        await message.answer("Укажи положительный числовой Telegram ID пользователя.")
+        return
+
+    if ADMIN_ID and user_id == ADMIN_ID:
+        await message.answer("Бесплатный доступ администратора нельзя отключить этой командой.")
+        return
+    if user_id in FREE_USER_IDS:
+        await message.answer(
+            f"ID <code>{user_id}</code> задан в FREE_USER_IDS. Удали его из переменной окружения и перезапусти бота.",
+            parse_mode="HTML"
+        )
+        return
+
+    cursor.execute("DELETE FROM free_users WHERE user_id = ?", (user_id,))
+    removed = cursor.rowcount > 0
+    db.commit()
+    subscription_notice_sent.discard(user_id)
+    logger.info("Free access revoked: user_id=%s admin_id=%s removed=%s", user_id, message.from_user.id, removed)
+    status = subscription_status_text(user_id)
+    result = "Бесплатный доступ удалён." if removed else "Записи о бесплатном доступе не было."
+    await message.answer(f"{result}\n{status}", parse_mode="HTML")
+
+
+@dp.message(Command("freeusers"), F.chat.type == "private")
+async def admin_list_free_users(message: types.Message):
+    if not ADMIN_ID or message.from_user.id != ADMIN_ID:
+        return
+
+    entries = {}
+    if ADMIN_ID:
+        entries[ADMIN_ID] = "администратор"
+    for user_id in FREE_USER_IDS:
+        entries[user_id] = "FREE_USER_IDS"
+    for user_id, granted_by, granted_at in cursor.execute(
+        "SELECT user_id, granted_by, granted_at FROM free_users ORDER BY user_id"
+    ).fetchall():
+        entries[user_id] = f"выдано {granted_at} (админ {granted_by})"
+
+    if not entries:
+        await message.answer("Список бесплатных пользователей пуст.")
+        return
+    lines = [f"<code>{user_id}</code> — {safe(source)}" for user_id, source in sorted(entries.items())]
+    await message.answer("🎁 <b>Бесплатный доступ</b>\n\n" + "\n".join(lines), parse_mode="HTML")
 
 @dp.message(Command("start"))
 @dp.message(Command("menu"))
