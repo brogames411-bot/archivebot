@@ -8,7 +8,7 @@ import sqlite3
 from io import StringIO
 import uuid
 import shutil
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from logging.handlers import RotatingFileHandler
 import qrcode
@@ -22,6 +22,7 @@ from aiogram.types import (
     FSInputFile,
     BufferedInputFile,
     InputProfilePhotoStatic,
+    LabeledPrice,
 )
 from aiogram.exceptions import TelegramBadRequest, TelegramNetworkError
 
@@ -35,8 +36,8 @@ from aiogram.exceptions import TelegramBadRequest, TelegramNetworkError
 TOKEN = os.getenv("BOT_TOKEN", "").strip()
 FFMPEG_PATH = os.getenv("FFMPEG_PATH", "ffmpeg").strip()
 
-SUPPORT_URL = "https://t.me/armgg077"
-
+SUPPORT_URL = "https://t.me/your_support"
+PREMIUM_URL = "https://t.me/your_premium"
 
 
 
@@ -130,6 +131,16 @@ def configure_logging():
 
 
 logger = configure_logging()
+
+SUBSCRIPTION_DAYS = 30
+try:
+    SUBSCRIPTION_PRICE_STARS = int(os.getenv("SUBSCRIPTION_PRICE_STARS", "100"))
+except ValueError:
+    SUBSCRIPTION_PRICE_STARS = 100
+    logger.warning("Invalid SUBSCRIPTION_PRICE_STARS; using 100 Stars")
+if not 1 <= SUBSCRIPTION_PRICE_STARS <= 10000:
+    logger.warning("SUBSCRIPTION_PRICE_STARS must be 1..10000; using 100 Stars")
+    SUBSCRIPTION_PRICE_STARS = 100
 
 DB_PATH = os.path.join(DATA_DIR, "business_archive.db")
 
@@ -262,6 +273,28 @@ CREATE TABLE IF NOT EXISTS muted_business_chats (
 )
 """)
 
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS subscriptions (
+    user_id INTEGER PRIMARY KEY,
+    expires_at TEXT NOT NULL,
+    last_charge_id TEXT,
+    updated_at TEXT NOT NULL
+)
+""")
+
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS payment_orders (
+    payload TEXT PRIMARY KEY,
+    user_id INTEGER NOT NULL,
+    amount INTEGER NOT NULL,
+    currency TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    charge_id TEXT,
+    created_at TEXT NOT NULL,
+    paid_at TEXT
+)
+""")
+
 
 # =========================================================
 # SPAM
@@ -326,6 +359,7 @@ db.commit()
 active_spam_tasks = {}
 game_invites = {}
 active_games = {}
+subscription_notice_sent = set()
 
 
 converter_users = set()
@@ -421,6 +455,94 @@ def get_settings(owner_id):
         bool(row[1]),
         bool(row[2])
     )
+
+
+def get_subscription_expiration(user_id):
+    if not user_id:
+        return None
+    row = cursor.execute(
+        "SELECT expires_at FROM subscriptions WHERE user_id = ?",
+        (user_id,)
+    ).fetchone()
+    if not row:
+        return None
+    try:
+        expiration = datetime.fromisoformat(row[0])
+        if expiration.tzinfo is None:
+            expiration = expiration.replace(tzinfo=timezone.utc)
+        return expiration
+    except (TypeError, ValueError):
+        logger.exception("Invalid subscription expiry stored: user_id=%s", user_id)
+        return None
+
+
+def is_subscription_active(user_id):
+    if not user_id:
+        return False
+    if ADMIN_ID and user_id == ADMIN_ID:
+        return True
+    expiration = get_subscription_expiration(user_id)
+    return bool(expiration and expiration > datetime.now(timezone.utc))
+
+
+def group_subscription_owner(chat_id):
+    row = cursor.execute(
+        "SELECT added_by_user_id FROM group_chats WHERE chat_id = ? AND enabled = 1",
+        (chat_id,)
+    ).fetchone()
+    return row[0] if row else None
+
+
+def subscription_status_text(user_id):
+    if ADMIN_ID and user_id == ADMIN_ID:
+        return "✅ У тебя бесплатный доступ администратора."
+    expiration = get_subscription_expiration(user_id)
+    if expiration and expiration > datetime.now(timezone.utc):
+        return (
+            "✅ Подписка активна до "
+            f"<b>{safe(expiration.strftime('%d.%m.%Y %H:%M UTC'))}</b>."
+        )
+    return "⛔ Активной подписки нет. Архивирование приостановлено."
+
+
+def subscription_page_text(user_id):
+    return (
+        "⭐ <b>Подписка ArchiveBot</b>\n\n"
+        f"{subscription_status_text(user_id)}\n\n"
+        f"Доступ на 30 дней — <b>{SUBSCRIPTION_PRICE_STARS} ⭐</b>.\n"
+        "Продление вручную, автоматических списаний нет.\n"
+        "Архивирование Business-переписки и подключённых групп включено при активном доступе.\n"
+        "Поддержка платежей: /paysupport · Условия: /terms."
+    )
+
+
+def subscription_keyboard(user_id):
+    rows = []
+    if not (ADMIN_ID and user_id == ADMIN_ID):
+        label = "🔄 Продлить на 30 дней" if is_subscription_active(user_id) else "⭐ Купить доступ на 30 дней"
+        rows.append([InlineKeyboardButton(text=label, callback_data="buy_subscription")])
+    rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="open_menu")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def notify_subscription_required(user_id):
+    if not user_id or user_id in subscription_notice_sent:
+        return
+    subscription_notice_sent.add(user_id)
+    try:
+        await bot.send_message(
+            chat_id=user_id,
+            text=(
+                "🔒 Для архивирования переписки нужна активная подписка.\n\n"
+                f"30 дней — {SUBSCRIPTION_PRICE_STARS} ⭐. Открой /subscription, чтобы оформить доступ."
+            ),
+            reply_markup=subscription_keyboard(user_id)
+        )
+    except Exception as error:
+        logger.debug(
+            "Could not send subscription notice: user_id=%s error=%s",
+            user_id, error
+        )
 
 
 async def get_business_connection(
@@ -553,7 +675,7 @@ def save_group_chat(chat, added_by_user_id=None, enabled=True):
             title = excluded.title,
             username = excluded.username,
             added_by_user_id = COALESCE(
-                excluded.added_by_user_id, group_chats.added_by_user_id
+                group_chats.added_by_user_id, excluded.added_by_user_id
             ),
             enabled = excluded.enabled,
             last_seen_at = excluded.last_seen_at
@@ -713,6 +835,13 @@ def main_keyboard(user_id=None):
 
         [
             InlineKeyboardButton(
+                text="⭐ Подписка / доступ",
+                callback_data="open_subscription"
+            )
+        ],
+
+        [
+            InlineKeyboardButton(
                 text="🟦 Мой Business",
                 callback_data="my_business"
             )
@@ -766,6 +895,13 @@ def main_keyboard(user_id=None):
             InlineKeyboardButton(
                 text="⚙️ Настройки",
                 callback_data="open_settings"
+            )
+        ],
+
+        [
+            InlineKeyboardButton(
+                text="💎 Business Premium ↗",
+                url=PREMIUM_URL
             )
         ],
 
@@ -1140,7 +1276,7 @@ async def business_connection_handler(
 
 # =========================================================
 # =========================================================
-# AUTO-ARCHIVE REPLIES — отправка сообщения из ответа администратору
+# AUTO-ARCHIVE REPLIES — отправка сообщения из ответа владельцу Business
 # =========================================================
 
 # Укажи свой Telegram ID через переменную окружения ADMIN_ID.
@@ -1151,12 +1287,26 @@ async def business_connection_handler(
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 
 
-async def send_photo_to_admin(photo_file_id, caption):
+def reply_archive_recipient_id(source_message):
+    connection_id = getattr(source_message, "business_connection_id", None)
+    if not connection_id:
+        return None
+    row = cursor.execute(
+        "SELECT user_chat_id FROM business_connections WHERE connection_id = ?",
+        (connection_id,)
+    ).fetchone()
+    if row and row[0]:
+        return row[0]
+    logger.error("Business reply recipient not found: connection_id=%s", connection_id)
+    return None
+
+
+async def send_photo_to_chat(chat_id, photo_file_id, caption):
     """Пытается переслать фото по file_id, а self-destructing фото перезагружает."""
 
     try:
         await bot.send_photo(
-            chat_id=ADMIN_ID,
+            chat_id=chat_id,
             photo=photo_file_id,
             caption=caption,
             parse_mode="HTML"
@@ -1187,21 +1337,25 @@ async def send_photo_to_admin(photo_file_id, caption):
         raise RuntimeError("Скачанный SelfDestructingPhoto оказался пустым")
 
     await bot.send_photo(
-        chat_id=ADMIN_ID,
+        chat_id=chat_id,
         photo=BufferedInputFile(photo_bytes, filename="saved_photo.jpg"),
         caption=caption,
         parse_mode="HTML"
     )
 
 
-async def send_replied_message_to_admin(
+async def send_replied_message_to_owner(
     source_message: types.Message,
     reply: types.Message
 ) -> bool:
-    """Отправляет администратору сообщение, на которое ответили."""
+    """Отправляет сохранённое сообщение владельцу Business-подключения."""
 
-    if not ADMIN_ID:
-        logger.error("ADMIN_ID не задан; пересылка ответов отключена")
+    recipient_id = reply_archive_recipient_id(source_message)
+    if not recipient_id:
+        logger.error(
+            "Reply archive recipient is unavailable: connection_id=%s",
+            getattr(source_message, "business_connection_id", None)
+        )
         return False
 
     connection_id = (
@@ -1251,7 +1405,8 @@ async def send_replied_message_to_admin(
 
         if reply.photo:
 
-            await send_photo_to_admin(
+            await send_photo_to_chat(
+                chat_id=recipient_id,
                 photo_file_id=reply.photo[-1].file_id,
                 caption=(
                     header +
@@ -1271,7 +1426,7 @@ async def send_replied_message_to_admin(
         if reply.video:
 
             await bot.send_video(
-                chat_id=ADMIN_ID,
+                chat_id=recipient_id,
                 video=reply.video.file_id,
                 caption=(
                     header +
@@ -1292,7 +1447,7 @@ async def send_replied_message_to_admin(
         if reply.document:
 
             await bot.send_document(
-                chat_id=ADMIN_ID,
+                chat_id=recipient_id,
                 document=reply.document.file_id,
                 caption=(
                     header +
@@ -1313,7 +1468,7 @@ async def send_replied_message_to_admin(
         if reply.audio:
 
             await bot.send_audio(
-                chat_id=ADMIN_ID,
+                chat_id=recipient_id,
                 audio=reply.audio.file_id,
                 caption=(
                     header +
@@ -1334,7 +1489,7 @@ async def send_replied_message_to_admin(
         if reply.voice:
 
             await bot.send_voice(
-                chat_id=ADMIN_ID,
+                chat_id=recipient_id,
                 voice=reply.voice.file_id,
                 caption=(
                     header +
@@ -1355,13 +1510,13 @@ async def send_replied_message_to_admin(
         if reply.video_note:
 
             await bot.send_message(
-                chat_id=ADMIN_ID,
+                chat_id=recipient_id,
                 text=header + "\n🎬 <b>Тип:</b> Кружок",
                 parse_mode="HTML"
             )
 
             await bot.send_video_note(
-                chat_id=ADMIN_ID,
+                chat_id=recipient_id,
                 video_note=reply.video_note.file_id
             )
 
@@ -1374,7 +1529,7 @@ async def send_replied_message_to_admin(
         if reply.animation:
 
             await bot.send_animation(
-                chat_id=ADMIN_ID,
+                chat_id=recipient_id,
                 animation=reply.animation.file_id,
                 caption=(
                     header +
@@ -1395,13 +1550,13 @@ async def send_replied_message_to_admin(
         if reply.sticker:
 
             await bot.send_message(
-                chat_id=ADMIN_ID,
+                chat_id=recipient_id,
                 text=header + "\n🧩 <b>Тип:</b> Стикер",
                 parse_mode="HTML"
             )
 
             await bot.send_sticker(
-                chat_id=ADMIN_ID,
+                chat_id=recipient_id,
                 sticker=reply.sticker.file_id
             )
 
@@ -1414,7 +1569,7 @@ async def send_replied_message_to_admin(
         if text:
 
             await bot.send_message(
-                chat_id=ADMIN_ID,
+                chat_id=recipient_id,
                 text=(
                     header +
                     "\n💬 <b>Текст:</b>\n"
@@ -1430,7 +1585,7 @@ async def send_replied_message_to_admin(
         # -----------------------------------------------------
 
         await bot.send_message(
-            chat_id=ADMIN_ID,
+            chat_id=recipient_id,
             text=(
                 header +
                 "\n⚠️ <b>Неизвестный тип сообщения.</b>"
@@ -1441,12 +1596,12 @@ async def send_replied_message_to_admin(
 
     except Exception as error:
 
-        logger.exception("Не удалось переслать сообщение администратору")
+        logger.exception("Не удалось отправить архивное сообщение владельцу Business")
 
         try:
 
             await bot.send_message(
-                chat_id=ADMIN_ID,
+                chat_id=recipient_id,
                 text=(
                     "❌ <b>Ошибка пересылки сообщения</b>\n\n"
                     f"<code>{safe(error)}</code>"
@@ -1455,7 +1610,7 @@ async def send_replied_message_to_admin(
             )
 
         except Exception:
-            logger.exception("Не удалось отправить админу уведомление об ошибке пересылки")
+            logger.exception("Не удалось уведомить владельца Business об ошибке пересылки")
 
         return False
 
@@ -1568,10 +1723,11 @@ def find_archived_message_for_quote(source_message, quote):
     return None, len(matches) > 1
 
 
-async def send_quote_to_admin(source_message, quote_text, ambiguous=False):
-    """Отправляет администратору цитату, если исходник найти не удалось."""
+async def send_quote_to_owner(source_message, quote_text, ambiguous=False):
+    """Отправляет владельцу Business цитату, если исходник найти не удалось."""
 
-    if not ADMIN_ID:
+    recipient_id = reply_archive_recipient_id(source_message)
+    if not recipient_id:
         return
 
     reason = (
@@ -1583,7 +1739,7 @@ async def send_quote_to_admin(source_message, quote_text, ambiguous=False):
     )
 
     await bot.send_message(
-        chat_id=ADMIN_ID,
+        chat_id=recipient_id,
         text=(
             "💾 <b>ЦИТАТА ИЗ ОТВЕТА</b>\n\n"
             f"💬 <b>Chat ID:</b> <code>{source_message.chat.id}</code>\n"
@@ -1654,11 +1810,11 @@ async def cancel_qr(
     await callback.answer(
         "Создание QR отменено."
     )
-async def forward_replied_message_to_admin(message: types.Message) -> bool:
-    """Отправляет администратору только медиа из сообщения, на которое ответили."""
+async def forward_replied_message_to_owner(message: types.Message) -> bool:
+    """Отправляет владельцу Business медиа из сообщения, на которое ответили."""
 
-    if not ADMIN_ID:
-        logger.error("ADMIN_ID не задан; пересылка ответов отключена")
+    if not reply_archive_recipient_id(message):
+        logger.error("Business reply recipient unavailable: chat_id=%s", message.chat.id)
         return False
 
     reply = message.reply_to_message or getattr(message, "external_reply", None)
@@ -1682,12 +1838,12 @@ async def forward_replied_message_to_admin(message: types.Message) -> bool:
                 chat_id=message.chat.id
             )
         elif quote_text:
-            await send_quote_to_admin(
+            await send_quote_to_owner(
                 source_message=message,
                 quote_text=quote_text,
                 ambiguous=ambiguous
             )
-            logger.info("Reply quote sent to admin: chat_id=%s", message.chat.id)
+            logger.info("Reply quote sent to Business owner: chat_id=%s", message.chat.id)
             return True
         else:
             logger.warning(
@@ -1704,14 +1860,14 @@ async def forward_replied_message_to_admin(message: types.Message) -> bool:
         type(reply).__name__
     )
 
-    sent = await send_replied_message_to_admin(
+    sent = await send_replied_message_to_owner(
         source_message=message,
         reply=reply
     )
 
     if sent:
         logger.info(
-            "Reply source forwarded to admin: chat_id=%s source_message_id=%s",
+            "Reply source forwarded to Business owner: chat_id=%s source_message_id=%s",
             message.chat.id,
             getattr(reply, "message_id", None)
         )
@@ -3327,6 +3483,11 @@ async def business_message_handler(
         if muted:
             return
 
+    if not is_subscription_active(owner_id):
+        await notify_subscription_required(owner_id)
+        logger.debug("Business archive skipped without subscription: owner_id=%s", owner_id)
+        return
+
     media_type, file_id = get_media_info(
         message
     )
@@ -3385,7 +3546,7 @@ async def business_message_handler(
         or getattr(message, "quote", None)
     ):
         try:
-            await forward_replied_message_to_admin(message)
+            await forward_replied_message_to_owner(message)
         except Exception:
             logger.exception(
                 "Business reply media forwarding failed: chat_id=%s message_id=%s",
@@ -3416,6 +3577,10 @@ async def edited_business_message_handler(
 
     owner_id = connection.user.id
     user_chat_id = connection.user_chat_id
+
+    if not is_subscription_active(owner_id):
+        await notify_subscription_required(owner_id)
+        return
 
     if cursor.execute(
         "SELECT 1 FROM muted_business_chats WHERE connection_id = ? AND chat_id = ?",
@@ -3603,6 +3768,10 @@ async def deleted_business_messages_handler(
 
     owner_id = connection.user.id
     user_chat_id = connection.user_chat_id
+
+    if not is_subscription_active(owner_id):
+        await notify_subscription_required(owner_id)
+        return
 
     if cursor.execute(
         "SELECT 1 FROM muted_business_chats WHERE connection_id = ? AND chat_id = ?",
@@ -3883,15 +4052,34 @@ async def bot_group_membership_handler(
         try:
             me = await bot.get_me()
             group_command = f"/group@{me.username}" if me.username else "/group"
+            welcome_keyboard = None
+            added_by = getattr(event.from_user, "id", None)
+            has_access = is_subscription_active(added_by)
+            if has_access:
+                welcome_text = (
+                    "📚 <b>Архив-бот подключён к группе.</b>\n\n"
+                    "Архивирование активно: бот сохраняет сообщения и доступные медиа, которые получает.\n"
+                    f"Напиши {group_command} для справки."
+                )
+            else:
+                welcome_text = (
+                    "📚 <b>Архив-бот добавлен в группу.</b>\n\n"
+                    "Для включения архивирования пользователь, который добавил бота, "
+                    "должен оформить доступ на 30 дней в личном чате.\n"
+                    f"Напиши {group_command} для справки."
+                )
+            if not has_access and me.username:
+                welcome_keyboard = InlineKeyboardMarkup(inline_keyboard=[[
+                    InlineKeyboardButton(
+                        text="⭐ Оформить доступ",
+                        url=f"https://t.me/{me.username}?start=subscription"
+                    )
+                ]])
             await bot.send_message(
                 chat_id=event.chat.id,
-                text=(
-                    "📚 <b>Архив-бот подключён к группе.</b>\n\n"
-                    "Он сохраняет сообщения и доступные медиа, которые получает, "
-                    "ответы на медиа автоматически пересылаются только из личных Business-чатов.\n"
-                    f"Напиши {group_command} для справки."
-                ),
-                parse_mode="HTML"
+                text=welcome_text,
+                parse_mode="HTML",
+                reply_markup=welcome_keyboard
             )
         except Exception:
             logger.exception(
@@ -3915,28 +4103,42 @@ async def group_help_command(message: types.Message):
         )
         return
 
-    save_group_chat(
-        message.chat,
-        added_by_user_id=getattr(message.from_user, "id", None)
-    )
-    await message.answer(
-        "👥 <b>Бот работает в группе</b>\n\n"
+    sender_id = getattr(message.from_user, "id", None)
+    added_by_user_id = sender_id if await is_group_admin(message.chat.id, sender_id) else None
+    save_group_chat(message.chat, added_by_user_id=added_by_user_id)
+    license_owner = group_subscription_owner(message.chat.id)
+    archive_access = is_subscription_active(license_owner)
+    if not archive_access:
+        await notify_subscription_required(license_owner)
+    archive_status = (
         "• сохраняет сообщения и медиа, которые Telegram ему передаёт;\n"
-        "• автопересылка медиа по ответу работает только в личных Business-чатах;\n"
-        "• команды: <code>/spam N текст</code>, <code>/bspam</code>, "
-        "<code>/stopspam</code>; игровые и личные команды в группе не работают;\n"
-        "• администратор бота может открыть архив в личном чате командой "
-        "<code>/logs</code>.\n\n"
-        "Чтобы архивировать все сообщения, сделай бота администратором группы "
-        "или отключи Privacy Mode у @BotFather и заново добавь бота.\n"
-        "Удаления обычных групповых сообщений Telegram боту не присылает.",
-        parse_mode="HTML"
+        if archive_access else
+        "🔒 Архивирование и команды рассылки приостановлены до оформления подписки. "
+        "Пользователь, добавивший бота, должен открыть бота в личке и отправить /subscription.\n"
     )
+    group_help_text = (
+        "👥 <b>Бот работает в группе</b>\n\n"
+        + archive_status
+        + "• автопересылка медиа по ответу работает только в личных Business-чатах;\n"
+        + "• команды: <code>/spam N текст</code>, <code>/bspam</code>, "
+        + "<code>/stopspam</code>; игровые и личные команды в группе не работают;\n"
+        + "• администратор бота может открыть архив в личном чате командой "
+        + "<code>/logs</code>.\n\n"
+        + "Чтобы архивировать все групповые сообщения, пользователь, добавивший бота, "
+        + "должен оформить подписку через /subscription; боту также нужны права "
+        + "администратора либо отключённый Privacy Mode у @BotFather.\n"
+        + "Удаления обычных групповых сообщений Telegram боту не присылает."
+    )
+    await message.answer(group_help_text, parse_mode="HTML")
 
 
 @dp.edited_message(F.chat.type.in_({"group", "supergroup"}))
 async def edited_group_message_handler(message: types.Message):
     save_group_chat(message.chat)
+    license_owner = group_subscription_owner(message.chat.id)
+    if not is_subscription_active(license_owner):
+        await notify_subscription_required(license_owner)
+        return
     connection_id = group_connection_id(message.chat.id)
     chat_id = message.chat.id
     old_row = cursor.execute("""
@@ -4003,6 +4205,15 @@ async def handle_group_spam_command(message: types.Message, command, args):
         getattr(message.from_user, "id", None)
     ):
         await message.reply("⛔ Команда доступна только администраторам группы.")
+        return True
+
+    license_owner = group_subscription_owner(chat_id)
+    if not is_subscription_active(license_owner):
+        await message.reply(
+            "🔒 Для команд бота в группе нужна активная подписка пользователя, "
+            "который добавил бота. Откройте бота в личке и отправьте /subscription."
+        )
+        await notify_subscription_required(license_owner)
         return True
 
     connection_id = group_connection_id(chat_id)
@@ -4557,6 +4768,307 @@ async def qr_message_handler(
 # /START
 # =========================================================
 
+async def send_subscription_invoice(user_id, chat_id):
+    if ADMIN_ID and user_id == ADMIN_ID:
+        await bot.send_message(chat_id, "У тебя бесплатный доступ администратора.")
+        return
+
+    payload = f"archivebot_30d_{user_id}_{uuid.uuid4().hex}"
+    created_at = datetime.now(timezone.utc).isoformat()
+    cursor.execute("""
+        INSERT INTO payment_orders (payload, user_id, amount, currency, status, created_at)
+        VALUES (?, ?, ?, 'XTR', 'pending', ?)
+    """, (payload, user_id, SUBSCRIPTION_PRICE_STARS, created_at))
+    db.commit()
+
+    try:
+        await bot.send_invoice(
+            chat_id=chat_id,
+            title="ArchiveBot — 30 дней",
+            description="30 дней архивирования Business-переписки и подключённых групп.",
+            payload=payload,
+            provider_token="",
+            currency="XTR",
+            prices=[LabeledPrice(label="Доступ на 30 дней", amount=SUBSCRIPTION_PRICE_STARS)]
+        )
+    except Exception:
+        cursor.execute(
+            "UPDATE payment_orders SET status = 'failed' WHERE payload = ?",
+            (payload,)
+        )
+        db.commit()
+        logger.exception("Could not send Stars invoice: user_id=%s", user_id)
+        await bot.send_message(
+            chat_id,
+            "Не получилось создать счёт. Попробуй ещё раз или напиши /paysupport."
+        )
+
+
+@dp.callback_query(lambda c: c.data == "open_subscription")
+async def open_subscription(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    await replace_menu(
+        callback,
+        subscription_page_text(user_id),
+        subscription_keyboard(user_id)
+    )
+    await callback.answer()
+
+
+@dp.callback_query(lambda c: c.data == "buy_subscription")
+async def buy_subscription_callback(callback: CallbackQuery):
+    if callback.message.chat.type != "private":
+        await callback.answer("Оплата доступна только в личном чате с ботом.", show_alert=True)
+        return
+    await send_subscription_invoice(callback.from_user.id, callback.message.chat.id)
+    await callback.answer()
+
+
+@dp.message(Command("subscription"), F.chat.type == "private")
+async def subscription_command(message: types.Message):
+    user_id = message.from_user.id
+    await message.answer(
+        subscription_page_text(user_id),
+        parse_mode="HTML",
+        reply_markup=subscription_keyboard(user_id)
+    )
+
+
+@dp.message(Command("subscribe"), F.chat.type == "private")
+@dp.message(Command("buy"), F.chat.type == "private")
+async def subscribe_command(message: types.Message):
+    await send_subscription_invoice(message.from_user.id, message.chat.id)
+
+
+@dp.pre_checkout_query()
+async def subscription_pre_checkout(query: types.PreCheckoutQuery):
+    row = cursor.execute("""
+        SELECT user_id, amount, currency, status, created_at
+        FROM payment_orders WHERE payload = ?
+    """, (query.invoice_payload,)).fetchone()
+
+    valid = False
+    if row:
+        user_id, amount, currency, status, created_at = row
+        try:
+            age = datetime.now(timezone.utc) - datetime.fromisoformat(created_at)
+            valid = (
+                user_id == query.from_user.id
+                and amount == query.total_amount
+                and currency == query.currency == "XTR"
+                and status == "pending"
+                and timedelta(0) <= age <= timedelta(days=1)
+            )
+        except (TypeError, ValueError):
+            valid = False
+
+    if not valid:
+        await query.answer(
+            ok=False,
+            error_message="Счёт недействителен или устарел. Создай новый через /subscription."
+        )
+        return
+
+    await query.answer(ok=True)
+
+
+@dp.message(F.successful_payment, F.chat.type == "private")
+async def subscription_successful_payment(message: types.Message):
+    payment = message.successful_payment
+    user_id = message.from_user.id
+    order = cursor.execute("""
+        SELECT user_id, amount, currency, status
+        FROM payment_orders WHERE payload = ?
+    """, (payment.invoice_payload,)).fetchone()
+
+    if not order:
+        logger.error("Successful payment has unknown payload: user_id=%s", user_id)
+        await message.answer("Платёж получен, но не удалось найти заказ. Напиши /paysupport.")
+        return
+
+    order_user_id, amount, currency, status = order
+    if order_user_id != user_id or amount != payment.total_amount or currency != payment.currency or currency != "XTR":
+        logger.error("Successful payment does not match order: user_id=%s", user_id)
+        await message.answer("Не удалось подтвердить заказ автоматически. Напиши /paysupport.")
+        return
+
+    if status == "paid":
+        await message.answer("Эта оплата уже учтена. Отправь /subscription, чтобы посмотреть доступ.")
+        return
+    if status != "pending":
+        logger.error(
+            "Successful payment belongs to non-pending order: user_id=%s status=%s",
+            user_id, status
+        )
+        await message.answer("Не удалось подтвердить заказ автоматически. Напиши /paysupport.")
+        return
+
+    now = datetime.now(timezone.utc)
+    current_expiry = get_subscription_expiration(user_id)
+    starts_at = current_expiry if current_expiry and current_expiry > now else now
+    expires_at = starts_at + timedelta(days=SUBSCRIPTION_DAYS)
+    charge_id = payment.telegram_payment_charge_id
+
+    cursor.execute("""
+        INSERT INTO subscriptions (user_id, expires_at, last_charge_id, updated_at)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(user_id) DO UPDATE SET
+            expires_at = excluded.expires_at,
+            last_charge_id = excluded.last_charge_id,
+            updated_at = excluded.updated_at
+    """, (user_id, expires_at.isoformat(), charge_id, now.isoformat()))
+    cursor.execute("""
+        UPDATE payment_orders
+        SET status = 'paid', charge_id = ?, paid_at = ?
+        WHERE payload = ? AND status = 'pending'
+    """, (charge_id, now.isoformat(), payment.invoice_payload))
+    db.commit()
+    subscription_notice_sent.discard(user_id)
+
+    logger.info(
+        "Subscription payment received: user_id=%s amount=%s expires_at=%s charge_id=%s",
+        user_id, payment.total_amount, expires_at.isoformat(), charge_id
+    )
+    await message.answer(
+        "✅ Оплата подтверждена. Архивирование включено до "
+        f"<b>{safe(expires_at.strftime('%d.%m.%Y %H:%M UTC'))}</b>.\n"
+        "Продление вручную через /subscription.",
+        parse_mode="HTML"
+    )
+
+
+@dp.message(Command("terms"), F.chat.type == "private")
+async def payment_terms_command(message: types.Message):
+    await message.answer(
+        "📄 <b>Условия доступа</b>\n\n"
+        f"ArchiveBot предоставляет архивирование Business-переписки и подключённых групп "
+        f"на 30 дней за {SUBSCRIPTION_PRICE_STARS} Telegram Stars.\n"
+        "Доступ включается после подтверждения платежа и продлевается вручную новым платежом. "
+        "Автоматических списаний нет. Бот сохраняет сообщения и медиа согласно настройкам архива; "
+        "доступ к новым архивным событиям приостанавливается после окончания срока.\n\n"
+        "По вопросам оплаты и возврата отправь /paysupport.",
+        parse_mode="HTML"
+    )
+
+
+@dp.message(Command("paysupport"), F.chat.type == "private")
+async def payment_support_command(message: types.Message):
+    if ADMIN_ID:
+        latest_payment = cursor.execute("""
+            SELECT amount, paid_at, charge_id FROM payment_orders
+            WHERE user_id = ? AND status = 'paid'
+            ORDER BY paid_at DESC LIMIT 1
+        """, (message.from_user.id,)).fetchone()
+        payment_details = (
+            f"Последний платёж: {latest_payment[0]} XTR; {latest_payment[1]}; "
+            f"charge_id={latest_payment[2]}"
+            if latest_payment else "Оплаченных заказов не найдено."
+        )
+        user_name = (
+            f"@{message.from_user.username}"
+            if message.from_user.username
+            else message.from_user.full_name
+        )
+        issue = (message.text or "").partition(" ")[2].strip() or "Описание не приложено."
+        try:
+            await bot.send_message(
+                chat_id=ADMIN_ID,
+                text=(
+                    "💳 Запрос поддержки по оплате\n"
+                    f"Пользователь: {user_name} (ID {message.from_user.id})\n"
+                    f"Проблема: {issue}\n{payment_details}"
+                )
+            )
+            response = "✅ Запрос передан администратору. Если нужно, добавь описание: /paysupport текст проблемы."
+        except Exception:
+            logger.exception("Could not forward payment support request: user_id=%s", message.from_user.id)
+            response = (
+                "Не удалось передать запрос автоматически. "
+                f'<a href="tg://user?id={ADMIN_ID}">Открой чат с администратором.</a>'
+            )
+    else:
+        response = "💳 Поддержка платежей пока не настроена. Сообщи владельцу бота о проблеме."
+    await message.answer(response, parse_mode="HTML")
+
+
+def recalculate_subscription_expiration(user_id):
+    paid_orders = cursor.execute("""
+        SELECT paid_at, charge_id FROM payment_orders
+        WHERE user_id = ? AND status = 'paid' AND paid_at IS NOT NULL
+        ORDER BY paid_at ASC
+    """, (user_id,)).fetchall()
+
+    expiration = None
+    last_charge_id = None
+    for paid_at_text, charge_id in paid_orders:
+        paid_at = datetime.fromisoformat(paid_at_text)
+        if paid_at.tzinfo is None:
+            paid_at = paid_at.replace(tzinfo=timezone.utc)
+        start_at = expiration if expiration and expiration > paid_at else paid_at
+        expiration = start_at + timedelta(days=SUBSCRIPTION_DAYS)
+        last_charge_id = charge_id
+
+    if expiration:
+        cursor.execute("""
+            INSERT INTO subscriptions (user_id, expires_at, last_charge_id, updated_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET
+                expires_at = excluded.expires_at,
+                last_charge_id = excluded.last_charge_id,
+                updated_at = excluded.updated_at
+        """, (
+            user_id, expiration.isoformat(), last_charge_id,
+            datetime.now(timezone.utc).isoformat()
+        ))
+    else:
+        cursor.execute("DELETE FROM subscriptions WHERE user_id = ?", (user_id,))
+    db.commit()
+
+
+@dp.message(Command("refund"), F.chat.type == "private")
+async def admin_refund_star_payment(message: types.Message):
+    if not ADMIN_ID or message.from_user.id != ADMIN_ID:
+        return
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) != 2:
+        await message.answer("Формат: /refund telegram_payment_charge_id")
+        return
+
+    charge_id = parts[1].strip()
+    order = cursor.execute("""
+        SELECT user_id, status FROM payment_orders WHERE charge_id = ?
+    """, (charge_id,)).fetchone()
+    if not order or order[1] != "paid":
+        await message.answer("Оплаченный заказ с таким charge_id не найден.")
+        return
+
+    buyer_id = order[0]
+    try:
+        refunded = await bot.refund_star_payment(
+            user_id=buyer_id,
+            telegram_payment_charge_id=charge_id
+        )
+        if not refunded:
+            await message.answer("Telegram не подтвердил возврат.")
+            return
+        cursor.execute(
+            "UPDATE payment_orders SET status = 'refunded' WHERE charge_id = ?",
+            (charge_id,)
+        )
+        recalculate_subscription_expiration(buyer_id)
+        await message.answer(f"✅ Возврат оформлен. Доступ пользователя {buyer_id} пересчитан.")
+        try:
+            await bot.send_message(
+                buyer_id,
+                "Возврат платежа оформлен. Если остались вопросы, отправь /paysupport."
+            )
+        except Exception:
+            logger.warning("Could not notify user about refund: user_id=%s", buyer_id)
+        logger.info("Stars payment refunded: user_id=%s charge_id=%s", buyer_id, charge_id)
+    except Exception:
+        logger.exception("Could not refund Stars payment: user_id=%s charge_id=%s", buyer_id, charge_id)
+        await message.answer("Не удалось оформить возврат. Проверь charge_id и логи.")
+
 @dp.message(Command("start"))
 @dp.message(Command("menu"))
 async def menu_command(
@@ -4569,6 +5081,15 @@ async def menu_command(
         if message.chat.type != "private":
             return
         await accept_game_invite(message, parts[1][5:])
+        return
+
+    if command == "/start" and len(parts) > 1 and parts[1] == "subscription":
+        if message.chat.type == "private":
+            await message.answer(
+                subscription_page_text(message.from_user.id),
+                parse_mode="HTML",
+                reply_markup=subscription_keyboard(message.from_user.id)
+            )
         return
 
     if message.chat.type in ("group", "supergroup"):
@@ -6503,6 +7024,11 @@ async def group_message_handler(message: types.Message):
         if await handle_group_spam_command(message, command, args):
             return
 
+    license_owner = group_subscription_owner(message.chat.id)
+    if not is_subscription_active(license_owner):
+        await notify_subscription_required(license_owner)
+        return
+
     connection_id = group_connection_id(message.chat.id)
     if message.from_user and message.from_user.is_bot:
         return
@@ -6576,6 +7102,11 @@ async def main():
     # -----------------------------------------------------
 
     logger.info("ADMIN_ID: %s", "задан" if ADMIN_ID else "не задан")
+    logger.info(
+        "Тариф архива: %s Telegram Stars / %s дней; продление вручную",
+        SUBSCRIPTION_PRICE_STARS,
+        SUBSCRIPTION_DAYS
+    )
 
     # =====================================================
     # WEBHOOK
