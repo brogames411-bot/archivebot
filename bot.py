@@ -286,6 +286,8 @@ CREATE TABLE IF NOT EXISTS muted_business_chats (
 )
 """)
 
+muted_delete_permission_warnings = set()
+
 cursor.execute("""
 CREATE TABLE IF NOT EXISTS subscriptions (
     user_id INTEGER PRIMARY KEY,
@@ -3907,14 +3909,34 @@ async def business_message_handler(
         or ""
     )
 
-    # Управление архивом конкретного Business-диалога доступно только
-    # владельцу аккаунта в личном чате. Это не ограничивает собеседника в Telegram.
+    command_text = (message.text or "").strip().casefold()
+
+    # Игры доступны владельцу в личном Business-чате, а также в обычном
+    # личном чате с ботом. В группах команды не обрабатываются.
+    if message.chat.type == "private" and user_id == owner_id:
+        if command_text == ".flip":
+            await bot.send_message(
+                chat_id=message.chat.id,
+                business_connection_id=message.business_connection_id,
+                text=random.choice(("🪙 Орёл!", "🪙 Решка!"))
+            )
+            return
+        if command_text == ".dice":
+            await bot.send_dice(
+                chat_id=message.chat.id,
+                business_connection_id=message.business_connection_id,
+                emoji="🎲"
+            )
+            return
+
+    # Управление мутом конкретного Business-диалога доступно только владельцу.
     if (
         message.chat.type == "private"
         and user_id == owner_id
-        and (message.text or "").strip().lower() in {".mute", ".unmute"}
+        and command_text in {".mute", ".unmute"}
     ):
-        command = message.text.strip().lower()
+        command = command_text
+        warning_key = (message.business_connection_id, message.chat.id)
         if command == ".mute":
             cursor.execute(
                 "INSERT OR IGNORE INTO muted_business_chats "
@@ -3922,7 +3944,18 @@ async def business_message_handler(
                 (message.business_connection_id, message.chat.id, datetime.now(timezone.utc).isoformat())
             )
             db.commit()
-            response = "🔇 Архивирование и уведомления для этого Business-чата приостановлены."
+            rights = getattr(connection, "rights", None)
+            can_delete_all = bool(getattr(rights, "can_delete_all_messages", False))
+            if can_delete_all:
+                muted_delete_permission_warnings.discard(warning_key)
+                response = "🔇 Мут включён: новые сообщения собеседника будут удаляться."
+            else:
+                muted_delete_permission_warnings.add(warning_key)
+                response = (
+                    "🔇 Мут включён, но бот пока не может удалять сообщения собеседника. "
+                    "В настройках Telegram Business → Чат-боты включи для бота право "
+                    "«Удалять все сообщения», затем отправь .mute ещё раз."
+                )
             logger.info(
                 "Business chat muted: connection_id=%s chat_id=%s owner_id=%s",
                 message.business_connection_id, message.chat.id, owner_id
@@ -3933,6 +3966,7 @@ async def business_message_handler(
                 (message.business_connection_id, message.chat.id)
             )
             db.commit()
+            muted_delete_permission_warnings.discard(warning_key)
             response = "🔊 Архивирование и уведомления для этого Business-чата возобновлены."
             logger.info(
                 "Business chat unmuted: connection_id=%s chat_id=%s owner_id=%s",
@@ -3945,13 +3979,73 @@ async def business_message_handler(
         )
         return
 
-    # При паузе игнорируем входящие сообщения собеседника в этом диалоге.
+    # При муте удаляем каждое новое входящее сообщение собеседника.
     if message.chat.type == "private" and user_id != owner_id:
         muted = cursor.execute(
             "SELECT 1 FROM muted_business_chats WHERE connection_id = ? AND chat_id = ?",
             (message.business_connection_id, message.chat.id)
         ).fetchone()
         if muted:
+            warning_key = (message.business_connection_id, message.chat.id)
+            rights = getattr(connection, "rights", None)
+            if not bool(getattr(rights, "can_delete_all_messages", False)):
+                if warning_key not in muted_delete_permission_warnings:
+                    muted_delete_permission_warnings.add(warning_key)
+                    logger.warning(
+                        "Muted chat cannot delete incoming messages without can_delete_all_messages: "
+                        "connection_id=%s chat_id=%s owner_id=%s",
+                        message.business_connection_id, message.chat.id, owner_id
+                    )
+                    try:
+                        await bot.send_message(
+                            chat_id=connection.user_chat_id,
+                            text=(
+                                "⚠️ Мут включён, но новые сообщения собеседника не удаляются: "
+                                "у бота нет права «Удалять все сообщения». Включи его в "
+                                "Telegram Business → Чат-боты."
+                            )
+                        )
+                    except Exception:
+                        logger.exception(
+                            "Could not notify Business owner about missing delete permission: "
+                            "connection_id=%s chat_id=%s owner_id=%s",
+                            message.business_connection_id, message.chat.id, owner_id
+                        )
+                return
+
+            try:
+                await bot.delete_business_messages(
+                    business_connection_id=message.business_connection_id,
+                    message_ids=[message.message_id]
+                )
+                logger.info(
+                    "Muted incoming Business message deleted: connection_id=%s chat_id=%s message_id=%s",
+                    message.business_connection_id, message.chat.id, message.message_id
+                )
+                muted_delete_permission_warnings.discard(warning_key)
+            except Exception as error:
+                logger.warning(
+                    "Failed to delete muted incoming Business message: "
+                    "connection_id=%s chat_id=%s message_id=%s error=%s",
+                    message.business_connection_id, message.chat.id, message.message_id, error
+                )
+                if warning_key not in muted_delete_permission_warnings:
+                    muted_delete_permission_warnings.add(warning_key)
+                    try:
+                        await bot.send_message(
+                            chat_id=connection.user_chat_id,
+                            text=(
+                                "⚠️ Не получилось удалить сообщение собеседника в замьюченном чате. "
+                                "Проверь, что у бота есть право «Удалять все сообщения» "
+                                "в Telegram Business → Чат-боты."
+                            )
+                        )
+                    except Exception:
+                        logger.exception(
+                            "Could not notify Business owner about muted-message delete failure: "
+                            "connection_id=%s chat_id=%s owner_id=%s",
+                            message.business_connection_id, message.chat.id, owner_id
+                        )
             return
 
     if not is_subscription_active(owner_id):
@@ -4877,12 +4971,24 @@ def ttt_winner(board):
     return None
 
 
-@dp.message(F.chat.type == "private", F.text == ".flip")
+@dp.message(
+    lambda message: (
+        message.chat.type == "private"
+        and isinstance(message.text, str)
+        and message.text.strip().casefold() == ".flip"
+    )
+)
 async def flip_command(message: types.Message):
     await message.answer(random.choice(("🪙 Орёл!", "🪙 Решка!")))
 
 
-@dp.message(F.chat.type == "private", F.text == ".dice")
+@dp.message(
+    lambda message: (
+        message.chat.type == "private"
+        and isinstance(message.text, str)
+        and message.text.strip().casefold() == ".dice"
+    )
+)
 async def dice_command(message: types.Message):
     await bot.send_dice(chat_id=message.chat.id, emoji="🎲")
 
@@ -5822,8 +5928,8 @@ async def connect_business(
         "Открой:\n"
         "<b>Настройки → Telegram Business → Чат-боты</b>\n\n"
 
-        "Добавь этого бота и выдай необходимые "
-        "разрешения.\n\n"
+        "Добавь этого бота и выдай права на чтение и отправку сообщений. "
+        "Для команды .mute также включи право «Удалять все сообщения».\n\n"
 
         "После подключения архивирование "
         "начнёт работать автоматически.",
@@ -6839,7 +6945,7 @@ async def command_flip_dice_help(callback: CallbackQuery):
         callback,
         "🪙 <b>.flip</b> — подбросить монетку\n"
         "🎲 <b>.dice</b> — бросить кубик.\n\n"
-        "Работает в личном чате с ботом.",
+        "Работает в личном чате с ботом и в личном Business-чате от владельца аккаунта.",
         back_keyboard("open_commands", "⬅️ К командам")
     )
 
@@ -6861,7 +6967,7 @@ async def command_mute_help(callback: CallbackQuery):
         callback,
         "🔇 <b>.mute</b> — приостановить архивирование Business-чата\n"
         "🔊 <b>.unmute</b> — возобновить архивирование.\n\n"
-        "Отправь команду в личном Business-диалоге от своего аккаунта. Это отключает обработку сообщений ботом в этом чате, но не ограничивает собеседника в Telegram. В группах команды не работают.",
+        "Отправь .mute в личном Business-диалоге от своего аккаунта: новые сообщения собеседника будут удаляться. Для этого выдай боту право «Удалять все сообщения» в настройках Telegram Business → Чат-боты. Команды в группах не работают.",
         back_keyboard("open_commands", "⬅️ К командам")
     )
 
