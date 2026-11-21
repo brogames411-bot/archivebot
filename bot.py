@@ -3912,8 +3912,14 @@ async def business_message_handler(
     command_text = (message.text or "").strip().casefold()
 
     # Игры доступны владельцу в личном Business-чате, а также в обычном
-    # личном чате с ботом. В группах команды не обрабатываются.
+    # личном чате с ботом. PvP создаётся именно в чате с соперником.
     if message.chat.type == "private" and user_id == owner_id:
+        if command_text in {".ttt", ".chk"}:
+            await create_business_game_invite(
+                message,
+                "ttt" if command_text == ".ttt" else "chk"
+            )
+            return
         if command_text == ".flip":
             await bot.send_message(
                 chat_id=message.chat.id,
@@ -4995,7 +5001,10 @@ async def dice_command(message: types.Message):
 
 @dp.message(F.chat.type == "private", F.text == ".ttt")
 async def ttt_command(message: types.Message):
-    await create_game_invite(message, "ttt")
+    await message.answer(
+        "Чтобы сыграть с собеседником, отправь .ttt прямо в личном Business-чате с ним. "
+        "Приглашение и игровое поле появятся в этой переписке."
+    )
 
 
 def _checkers_moves(board, side):
@@ -5052,7 +5061,10 @@ def _checkers_over(board, turn):
 
 @dp.message(F.chat.type == "private", F.text == ".chk")
 async def checkers_command(message: types.Message):
-    await create_game_invite(message, "chk")
+    await message.answer(
+        "Чтобы сыграть с собеседником, отправь .chk прямо в личном Business-чате с ним. "
+        "Приглашение и игровое поле появятся в этой переписке."
+    )
 
 
 # =========================================================
@@ -5085,6 +5097,82 @@ async def create_game_invite(message: types.Message, game_type: str):
     )
 
 
+async def create_business_game_invite(message: types.Message, game_type: str):
+    connection_id = getattr(message, "business_connection_id", None)
+    creator_id = getattr(getattr(message, "from_user", None), "id", None)
+    opponent_id = getattr(getattr(message, "chat", None), "id", None)
+    if not connection_id or not creator_id or not opponent_id or message.chat.type != "private":
+        logger.warning("Cannot create Business PvP invite: missing chat or connection data")
+        return
+    if creator_id == opponent_id:
+        await bot.send_message(
+            chat_id=message.chat.id,
+            business_connection_id=connection_id,
+            text="Не удалось определить собеседника для игры. Отправь команду в личном Business-чате с ним."
+        )
+        return
+
+    invite_id = uuid.uuid4().hex[:16]
+    invite = {
+        "type": game_type,
+        "creator_id": creator_id,
+        "opponent_id": opponent_id,
+        "connection_id": connection_id,
+        "chat_id": message.chat.id,
+        "location": "business",
+        "created_at": datetime.now(timezone.utc).timestamp()
+    }
+    game_invites[invite_id] = invite
+    title = "крестики-нолики" if game_type == "ttt" else "шашки"
+    try:
+        sent = await bot.send_message(
+            chat_id=message.chat.id,
+            business_connection_id=connection_id,
+            text=f"🎮 Вызов на {title}! Нажми кнопку, чтобы сыграть против владельца аккаунта.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(
+                    text="✅ Принять вызов",
+                    callback_data=f"pvp_accept:{invite_id}"
+                )
+            ]])
+        )
+        invite["message_id"] = sent.message_id
+        logger.info(
+            "Business PvP invite sent: invite_id=%s game_type=%s creator_id=%s opponent_id=%s",
+            invite_id, game_type, creator_id, opponent_id
+        )
+    except Exception:
+        game_invites.pop(invite_id, None)
+        logger.exception(
+            "Could not send Business PvP invite: game_type=%s creator_id=%s chat_id=%s",
+            game_type, creator_id, message.chat.id
+        )
+        try:
+            await bot.send_message(
+                chat_id=creator_id,
+                text="Не получилось отправить приглашение в эту переписку. Проверь права бота на отправку Business-сообщений."
+            )
+        except Exception:
+            logger.exception("Could not notify game creator about failed Business invite: creator_id=%s", creator_id)
+
+
+def new_pvp_game_state(game_type: str, creator_id: int, opponent_id: int, **extra):
+    if game_type == "ttt":
+        game = {
+            "type": "ttt", "players": {"X": creator_id, "O": opponent_id},
+            "board": [None] * 9, "turn": "X", "finished": False,
+            "status": "", "message_ids": {}
+        }
+    else:
+        game = {
+            "type": "chk", "players": {"w": creator_id, "b": opponent_id},
+            "board": _pvp_checkers_board(), "turn": "w", "finished": False,
+            "status": "", "selected": None, "selected_by": None, "message_ids": {}
+        }
+    game.update(extra)
+    return game
+
+
 def _pvp_checkers_board():
     board = [[None for _ in range(8)] for _ in range(8)]
     for r in range(3):
@@ -5112,6 +5200,21 @@ def _pvp_game_text(game, user_id):
     return f"♟ Шашки PvP\nТы играешь {'белыми' if side == 'w' else 'чёрными'}. {status}"
 
 
+def _pvp_business_game_text(game):
+    if game["type"] == "ttt":
+        turn_owner = game["players"][game["turn"]] == game["creator_id"]
+        status = game["status"] if game["finished"] else (
+            "Ход владельца аккаунта." if turn_owner else "Ход собеседника."
+        )
+        return f"⭕ Крестики-нолики — игра один на один\n{status}"
+
+    turn_owner = game["players"][game["turn"]] == game["creator_id"]
+    status = game["status"] if game["finished"] else (
+        "Ход владельца аккаунта." if turn_owner else "Ход собеседника."
+    )
+    return f"♟ Шашки — игра один на один\n{status}"
+
+
 def _pvp_game_keyboard(game_id, game, user_id):
     if game["type"] == "ttt":
         buttons = [InlineKeyboardButton(
@@ -5123,7 +5226,10 @@ def _pvp_game_keyboard(game_id, game, user_id):
         return InlineKeyboardMarkup(inline_keyboard=[buttons[i:i + 3] for i in range(0, 9, 3)])
 
     symbols = {"w": "⚪", "W": "🔵", "b": "⚫", "B": "🔴"}
-    selected = game["selected"] if game.get("selected_by") == user_id else None
+    selected = game["selected"] if (
+        game.get("location") == "business"
+        or game.get("selected_by") == user_id
+    ) else None
     rows = []
     for r in range(8):
         row = []
@@ -5142,6 +5248,22 @@ def _pvp_game_keyboard(game_id, game, user_id):
 
 async def _refresh_pvp_game(game_id):
     game = active_games[game_id]
+    if game.get("location") == "business":
+        try:
+            await bot.edit_message_text(
+                business_connection_id=game["connection_id"],
+                chat_id=game["chat_id"],
+                message_id=game["message_id"],
+                text=_pvp_business_game_text(game),
+                reply_markup=_pvp_game_keyboard(game_id, game, game["creator_id"])
+            )
+        except TelegramBadRequest as error:
+            if "message is not modified" not in str(error).lower():
+                logger.warning("Business PvP game refresh failed: game_id=%s error=%s", game_id, error)
+        except Exception:
+            logger.exception("Business PvP game refresh failed: game_id=%s", game_id)
+        return
+
     for user_id, message_id in list(game["message_ids"].items()):
         try:
             await bot.edit_message_text(
@@ -5173,18 +5295,9 @@ async def accept_game_invite(message: types.Message, invite_id: str):
         return
 
     game_id = uuid.uuid4().hex[:12]
-    if invite["type"] == "ttt":
-        game = {
-            "type": "ttt", "players": {"X": creator_id, "O": opponent_id},
-            "board": [None] * 9, "turn": "X", "finished": False,
-            "status": "", "message_ids": {}
-        }
-    else:
-        game = {
-            "type": "chk", "players": {"w": creator_id, "b": opponent_id},
-            "board": _pvp_checkers_board(), "turn": "w", "finished": False,
-            "status": "", "selected": None, "selected_by": None, "message_ids": {}
-        }
+    game = new_pvp_game_state(
+        invite["type"], creator_id, opponent_id, location="private"
+    )
 
     active_games[game_id] = game
     game_invites.pop(invite_id, None)
@@ -5209,9 +5322,90 @@ async def accept_game_invite(message: types.Message, invite_id: str):
     await message.answer("Приглашение принято. Игра началась в личных чатах у обоих игроков.")
 
 
+@dp.callback_query(lambda c: c.data.startswith("pvp_accept:"))
+async def accept_business_game_invite(callback: CallbackQuery):
+    invite_id = callback.data.split(":", 1)[1]
+    invite = game_invites.get(invite_id)
+    if not invite or invite.get("location") != "business":
+        await callback.answer("Приглашение не найдено или уже использовано.", show_alert=True)
+        return
+
+    if datetime.now(timezone.utc).timestamp() - invite["created_at"] > 86400:
+        game_invites.pop(invite_id, None)
+        await callback.answer("Приглашение истекло. Попроси владельца отправить новое.", show_alert=True)
+        return
+
+    board_message = callback.message
+    if (
+        not board_message
+        or board_message.chat.type != "private"
+        or board_message.chat.id != invite["chat_id"]
+        or getattr(board_message, "business_connection_id", None) != invite["connection_id"]
+    ):
+        await callback.answer("Это приглашение из другой переписки.", show_alert=True)
+        return
+
+    if callback.from_user.id != invite["opponent_id"]:
+        await callback.answer("Принять вызов может только собеседник.", show_alert=True)
+        return
+    if invite.get("accepting"):
+        await callback.answer("Запускаю игру…")
+        return
+
+    invite["accepting"] = True
+    creator_id = invite["creator_id"]
+    opponent_id = invite["opponent_id"]
+    game_id = uuid.uuid4().hex[:12]
+    game = new_pvp_game_state(
+        invite["type"],
+        creator_id,
+        opponent_id,
+        location="business",
+        connection_id=invite["connection_id"],
+        chat_id=invite["chat_id"],
+        message_id=board_message.message_id
+    )
+    game["creator_id"] = creator_id
+    active_games[game_id] = game
+
+    try:
+        await bot.edit_message_text(
+            business_connection_id=invite["connection_id"],
+            chat_id=invite["chat_id"],
+            message_id=board_message.message_id,
+            text=_pvp_business_game_text(game),
+            reply_markup=_pvp_game_keyboard(game_id, game, creator_id)
+        )
+    except Exception:
+        active_games.pop(game_id, None)
+        invite["accepting"] = False
+        logger.exception("Could not start Business PvP game: invite_id=%s", invite_id)
+        await callback.answer("Не удалось открыть игровое поле. Попробуй ещё раз.", show_alert=True)
+        return
+
+    game_invites.pop(invite_id, None)
+    logger.info(
+        "Business PvP game started: game_id=%s game_type=%s player_ids=%s,%s chat_id=%s",
+        game_id, game["type"], creator_id, opponent_id, invite["chat_id"]
+    )
+    await callback.answer("Игра началась!")
+
+
 @dp.callback_query(lambda c: c.data == "pvp_noop")
 async def pvp_noop(callback: CallbackQuery):
     await callback.answer()
+
+
+def pvp_callback_in_game_chat(callback: CallbackQuery, game) -> bool:
+    message = callback.message
+    if not message or message.chat.type != "private":
+        return False
+    if game.get("location") == "business":
+        return (
+            message.chat.id == game["chat_id"]
+            and getattr(message, "business_connection_id", None) == game["connection_id"]
+        )
+    return True
 
 
 @dp.callback_query(lambda c: c.data.startswith("pvp_tt:"))
@@ -5223,7 +5417,7 @@ async def pvp_ttt_move(callback: CallbackQuery):
     except (ValueError, KeyError):
         await callback.answer("Игра не найдена.", show_alert=True)
         return
-    if callback.message.chat.type != "private" or game["type"] != "ttt":
+    if not pvp_callback_in_game_chat(callback, game) or game["type"] != "ttt":
         await callback.answer("Игра доступна только в личном чате.", show_alert=True)
         return
     mark = "X" if game["players"]["X"] == callback.from_user.id else "O" if game["players"]["O"] == callback.from_user.id else None
@@ -5254,7 +5448,7 @@ async def pvp_checkers_move(callback: CallbackQuery):
     except (ValueError, KeyError):
         await callback.answer("Игра не найдена.", show_alert=True)
         return
-    if callback.message.chat.type != "private" or game["type"] != "chk":
+    if not pvp_callback_in_game_chat(callback, game) or game["type"] != "chk":
         await callback.answer("Игра доступна только в личном чате.", show_alert=True)
         return
     side = game["turn"]
@@ -6956,7 +7150,7 @@ async def command_games_help(callback: CallbackQuery):
         callback,
         "♟ <b>.chk</b> — пригласить игрока в шашки\n"
         "⭕ <b>.ttt</b> — пригласить игрока в крестики-нолики.\n\n"
-        "Отправь команду боту в личке и перешли ссылку сопернику. Он должен открыть её и нажать Start. После этого доска появится в личных чатах у обоих игроков.",
+        "Отправь команду прямо в личном Business-чате с нужным соперником. Приглашение и общее игровое поле появятся в этой переписке. Собеседник принимает вызов кнопкой, затем вы ходите по очереди. В личном чате с ботом команды подскажут, куда их отправить.",
         back_keyboard("open_commands", "⬅️ К командам")
     )
 
