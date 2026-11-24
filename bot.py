@@ -1570,24 +1570,7 @@ async def replace_menu(
     old_chat_id = callback.message.chat.id
     old_message_id = callback.message.message_id
 
-    # -----------------------------------------------------
-    # Сначала удаляем старый экран
-    # -----------------------------------------------------
-
-    try:
-
-        await bot.delete_message(
-            chat_id=old_chat_id,
-            message_id=old_message_id
-        )
-
-    except Exception as error:
-
-        logger.warning('%s %s', "⚠️ Не удалось удалить старый экран:", repr(error))
-
-    # -----------------------------------------------------
-    # Потом отправляем новый — он будет последним
-    # -----------------------------------------------------
+    # Сначала отправляем новый экран, чтобы при сбое старый не исчез.
 
     try:
         if photo:
@@ -1599,11 +1582,10 @@ async def replace_menu(
                     parse_mode="HTML",
                     reply_markup=keyboard
                 )
-            except TelegramNetworkError:
-                raise
-            except Exception:
+            except Exception as error:
                 logger.exception(
-                    "Не удалось отправить фото-инструкцию меню; отправляю только текст"
+                    "Не удалось отправить фото меню (%r); пробую отправить текст",
+                    error
                 )
                 new_message = await bot.send_message(
                     chat_id=old_chat_id,
@@ -1619,15 +1601,37 @@ async def replace_menu(
                 reply_markup=keyboard
             )
 
-    except TelegramNetworkError as error:
-
-        logger.warning('%s %s', "🌐 Telegram network error:", repr(error))
-
-        await callback.answer(
-            "🌐 Telegram временно недоступен."
+    except TelegramNetworkError:
+        logger.exception(
+            "Не удалось отправить экран меню в Telegram: chat_id=%s photo=%s",
+            old_chat_id,
+            bool(photo)
         )
-
+        try:
+            await callback.answer("Не получилось открыть меню. Попробуй ещё раз.")
+        except Exception:
+            pass
         return None
+    except Exception:
+        logger.exception(
+            "Ошибка при открытии экрана меню: chat_id=%s photo=%s",
+            old_chat_id,
+            bool(photo)
+        )
+        try:
+            await callback.answer("Не получилось открыть меню. Ошибка записана в лог.")
+        except Exception:
+            pass
+        return None
+
+    # Удаляем старый экран только после успешной отправки нового.
+    try:
+        await bot.delete_message(
+            chat_id=old_chat_id,
+            message_id=old_message_id
+        )
+    except Exception as error:
+        logger.warning("Не удалось удалить старый экран меню: %r", error)
 
     save_menu_state(
         owner_id,
