@@ -601,7 +601,6 @@ db.commit()
 active_spam_tasks = {}
 game_invites = {}
 active_games = {}
-game_command_delete_warnings = set()
 subscription_notice_sent = set()
 
 
@@ -4202,10 +4201,6 @@ async def edited_business_message_handler(
     owner_id = connection.user.id
     user_chat_id = connection.user_chat_id
 
-    if not is_subscription_active(owner_id):
-        await notify_subscription_required(owner_id)
-        return
-
     if cursor.execute(
         "SELECT 1 FROM muted_business_chats WHERE connection_id = ? AND chat_id = ?",
         (message.business_connection_id, message.chat.id)
@@ -4472,6 +4467,21 @@ async def deleted_business_messages_handler(
         ))
 
         db.commit()
+
+        if (text or "").strip().casefold() in {
+            ".flip", ".dice", ".ttt", ".chk", ".rps", ".c4"
+        }:
+            logger.debug(
+                "Game command deletion notice suppressed: connection_id=%s chat_id=%s message_id=%s",
+                event.business_connection_id,
+                event.chat.id,
+                message_id
+            )
+            continue
+
+        if not is_subscription_active(owner_id):
+            await notify_subscription_required(owner_id)
+            return
 
         if user_id == owner_id:
             logger.debug(
@@ -5041,21 +5051,6 @@ async def delete_game_command_message(message) -> bool:
             getattr(message, "message_id", None),
             error
         )
-        connection_id = getattr(message, "business_connection_id", None)
-        owner_id = getattr(getattr(message, "from_user", None), "id", None)
-        if connection_id and owner_id and owner_id not in game_command_delete_warnings:
-            game_command_delete_warnings.add(owner_id)
-            try:
-                await bot.send_message(
-                    chat_id=owner_id,
-                    text=(
-                        "ℹ️ Игровая команда не удалилась из Business-чата. "
-                        "В Telegram Business → Чат-боты включи для бота право "
-                        "«Удалять все сообщения» — тогда останется только ответ или игровое поле."
-                    )
-                )
-            except Exception:
-                logger.exception("Could not notify owner about game command delete permission: user_id=%s", owner_id)
         return False
 
 
@@ -5197,10 +5192,6 @@ async def dice_command(message: types.Message):
 )
 async def business_game_help(message: types.Message):
     await delete_game_command_message(message)
-    await message.answer(
-        "Чтобы сыграть с собеседником, отправь команду прямо в личном Business-чате с ним. "
-        "Приглашение и игровое поле появятся в этой переписке."
-    )
 
 
 def _checkers_moves(board, side):
@@ -5294,6 +5285,16 @@ def game_user_label(user, fallback_id=None):
     last_name = getattr(user, "last_name", None)
     display_name = " ".join(part for part in (first_name, last_name) if part)
     return display_name or f"ID {fallback_id or 'неизвестен'}"
+
+
+def update_pvp_player_label(game, user):
+    user_id = getattr(user, "id", None)
+    if user_id is None:
+        return
+    player_ids = set(game.get("players", {}).values())
+    player_ids.update((game.get("creator_id"), game.get("opponent_id")))
+    if user_id in player_ids:
+        game.setdefault("player_labels", {})[user_id] = game_user_label(user, user_id)
 
 
 async def create_business_game_invite(message: types.Message, game_type: str):
@@ -5666,7 +5667,7 @@ async def accept_business_game_invite(callback: CallbackQuery):
     game["opponent_id"] = opponent_id
     game["player_labels"] = {
         creator_id: invite["creator_label"],
-        opponent_id: invite["opponent_label"]
+        opponent_id: game_user_label(callback.from_user, opponent_id)
     }
     active_games[game_id] = game
 
@@ -5789,6 +5790,8 @@ async def pvp_ttt_move(callback: CallbackQuery):
         await callback.answer("Игра доступна только в личном чате.", show_alert=True)
         return
     mark = "X" if game["players"]["X"] == callback.from_user.id else "O" if game["players"]["O"] == callback.from_user.id else None
+    if mark:
+        update_pvp_player_label(game, callback.from_user)
     if game["finished"] or mark != game["turn"]:
         await callback.answer(_pvp_turn_notice(game))
         return
@@ -5830,6 +5833,7 @@ async def pvp_rps_move(callback: CallbackQuery):
     if callback.from_user.id not in (game["creator_id"], game["opponent_id"]):
         await callback.answer("Ты не участник этой игры.", show_alert=True)
         return
+    update_pvp_player_label(game, callback.from_user)
     if game["finished"]:
         await callback.answer("Игра уже завершена.")
         return
@@ -5878,6 +5882,7 @@ async def pvp_connect4_move(callback: CallbackQuery):
     if callback.from_user.id not in game["players"].values():
         await callback.answer("Ты не участник этой игры.", show_alert=True)
         return
+    update_pvp_player_label(game, callback.from_user)
     if game["finished"]:
         await callback.answer("Игра уже завершена.")
         return
@@ -5921,6 +5926,10 @@ async def pvp_checkers_move(callback: CallbackQuery):
     if not pvp_callback_in_game_chat(callback, game) or game["type"] != "chk":
         await callback.answer("Игра доступна только в личном чате.", show_alert=True)
         return
+    if callback.from_user.id not in game["players"].values():
+        await callback.answer("Ты не участник этой игры.", show_alert=True)
+        return
+    update_pvp_player_label(game, callback.from_user)
     side = game["turn"]
     if game["finished"] or game["players"][side] != callback.from_user.id:
         await callback.answer(_pvp_turn_notice(game))
@@ -6600,17 +6609,29 @@ async def connect_business(
 
         "🚀 <b>Подключить Business</b>\n\n"
 
-        "Открой:\n"
+        "Нажми кнопку ниже, затем открой:\n"
         "<b>Настройки → Telegram Business → Чат-боты</b>\n\n"
 
-        "Добавь этого бота и выдай права на чтение и отправку сообщений. "
+        "Выбери ArchiveBot и нажми «Подключить». Telegram не позволяет открыть "
+        "этот экран со заранее выбранным ботом. Выдай права на чтение и отправку сообщений. "
         "Чтобы бот удалял игровые команды и работал .mute, включи право "
         "«Удалять все сообщения».\n\n"
 
         "После подключения архивирование "
         "начнёт работать автоматически.",
 
-        back_keyboard()
+        InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(
+                    text="⚙️ Открыть настройки Telegram",
+                    url="tg://settings"
+                )],
+                [InlineKeyboardButton(
+                    text="⬅️ Назад",
+                    callback_data="open_menu"
+                )]
+            ]
+        )
     )
 
 
@@ -7635,7 +7656,7 @@ async def command_games_help(callback: CallbackQuery):
         "✊ <b>.rps</b> — камень, ножницы, бумага\n"
         "🔴 <b>.c4</b> — четыре в ряд.\n"
         "Игровые команды удаляются после обработки, приглашение и поле остаются. После партии нажмите «Реванш», чтобы начать следующую; первый ход перейдёт другому игроку.\n\n"
-        "Отправь команду прямо в личном Business-чате с нужным соперником. Приглашение и общее игровое поле появятся в этой переписке. Собеседник принимает вызов кнопкой, затем вы ходите по очереди. В личном чате с ботом команды подскажут, куда их отправить.",
+        "Отправь команду прямо в личном Business-чате с нужным соперником. Приглашение и общее игровое поле появятся в этой переписке. Собеседник принимает вызов кнопкой, затем вы ходите по очереди. В личном чате с ботом игровые команды удаляются молча.",
         back_keyboard("open_commands", "⬅️ К командам")
     )
 
