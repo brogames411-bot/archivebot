@@ -1196,7 +1196,7 @@ def main_keyboard(user_id=None):
     rows = [
         [
             InlineKeyboardButton(
-                text="🚀 Подключить Business",
+                text="🚀 Подключить чат-бота",
                 callback_data="connect_business"
             )
         ],
@@ -1561,7 +1561,8 @@ async def show_main_menu(
 async def replace_menu(
     callback: CallbackQuery,
     text,
-    keyboard
+    keyboard,
+    photo=None
 ):
 
     owner_id = callback.from_user.id
@@ -1589,13 +1590,34 @@ async def replace_menu(
     # -----------------------------------------------------
 
     try:
-
-        new_message = await bot.send_message(
-            chat_id=old_chat_id,
-            text=text,
-            parse_mode="HTML",
-            reply_markup=keyboard
-        )
+        if photo:
+            try:
+                new_message = await bot.send_photo(
+                    chat_id=old_chat_id,
+                    photo=FSInputFile(photo),
+                    caption=text,
+                    parse_mode="HTML",
+                    reply_markup=keyboard
+                )
+            except TelegramNetworkError:
+                raise
+            except Exception:
+                logger.exception(
+                    "Не удалось отправить фото-инструкцию меню; отправляю только текст"
+                )
+                new_message = await bot.send_message(
+                    chat_id=old_chat_id,
+                    text=text,
+                    parse_mode="HTML",
+                    reply_markup=keyboard
+                )
+        else:
+            new_message = await bot.send_message(
+                chat_id=old_chat_id,
+                text=text,
+                parse_mode="HTML",
+                reply_markup=keyboard
+            )
 
     except TelegramNetworkError as error:
 
@@ -4011,7 +4033,8 @@ async def business_message_handler(
                 muted_delete_permission_warnings.add(warning_key)
                 response = (
                     "🔇 Мут включён, но бот пока не может удалять сообщения собеседника. "
-                    "В настройках Telegram Business → Чат-боты включи для бота право "
+                    "Открой Настройки → Изм. → Автоматизация чатов → "
+                    "Message Archive Bot и включи право "
                     "«Удалять все сообщения», затем отправь .mute ещё раз."
                 )
             logger.info(
@@ -4059,8 +4082,8 @@ async def business_message_handler(
                             chat_id=connection.user_chat_id,
                             text=(
                                 "⚠️ Мут включён, но новые сообщения собеседника не удаляются: "
-                                "у бота нет права «Удалять все сообщения». Включи его в "
-                                "Telegram Business → Чат-боты."
+                                "у бота нет права «Удалять все сообщения». Включи его: "
+                                "Настройки → Изм. → Автоматизация чатов → Message Archive Bot."
                             )
                         )
                     except Exception:
@@ -4094,8 +4117,8 @@ async def business_message_handler(
                             chat_id=connection.user_chat_id,
                             text=(
                                 "⚠️ Не получилось удалить сообщение собеседника в замьюченном чате. "
-                                "Проверь, что у бота есть право «Удалять все сообщения» "
-                                "в Telegram Business → Чат-боты."
+                                "Проверь право «Удалять все сообщения»: Настройки → Изм. → "
+                                "Автоматизация чатов → Message Archive Bot."
                             )
                         )
                     except Exception:
@@ -6607,13 +6630,14 @@ async def connect_business(
     await replace_menu(
         callback,
 
-        "🚀 <b>Подключить Business</b>\n\n"
+        "🚀 <b>Подключить чат-бота</b>\n\n"
 
-        "Нажми кнопку ниже, затем открой:\n"
-        "<b>Настройки → Telegram Business → Чат-боты</b>\n\n"
+        "Нажми кнопку ниже, затем в Telegram открой <b>Настройки → Изм. → "
+        "Автоматизация чатов</b>. Введи <code>message_archive_bot</code> и выбери "
+        "<b>Message Archive Bot (@Message_Archive_Bot)</b>.\n\n"
 
-        "Выбери ArchiveBot и нажми «Подключить». Telegram не позволяет открыть "
-        "этот экран со заранее выбранным ботом. Выдай права на чтение и отправку сообщений. "
+        "Проверь разрешения на чтение и отправку сообщений. Telegram не позволяет "
+        "открыть экран автоматизации со заранее выбранным ботом. "
         "Чтобы бот удалял игровые команды и работал .mute, включи право "
         "«Удалять все сообщения».\n\n"
 
@@ -6631,6 +6655,10 @@ async def connect_business(
                     callback_data="open_menu"
                 )]
             ]
+        ),
+        photo=os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            "business_connect_guide.png"
         )
     )
 
@@ -7667,7 +7695,7 @@ async def command_mute_help(callback: CallbackQuery):
         callback,
         "🔇 <b>.mute</b> — приостановить архивирование Business-чата\n"
         "🔊 <b>.unmute</b> — возобновить архивирование.\n\n"
-        "Отправь .mute в личном Business-диалоге от своего аккаунта: новые сообщения собеседника будут удаляться. Для этого выдай боту право «Удалять все сообщения» в настройках Telegram Business → Чат-боты. Команды в группах не работают.",
+        "Отправь .mute в личном подключённом чате от своего аккаунта: новые сообщения собеседника будут удаляться. Для этого выдай боту право «Удалять все сообщения»: Настройки → Изм. → Автоматизация чатов → Message Archive Bot. Команды в группах не работают.",
         back_keyboard("open_commands", "⬅️ К командам")
     )
 
