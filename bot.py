@@ -5478,6 +5478,14 @@ def _pvp_business_game_text(game):
 
 
 def _pvp_game_keyboard(game_id, game, user_id):
+    if game.get("location") == "business" and game["finished"]:
+        return InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(
+                text="🔁 Реванш",
+                callback_data=f"pvp_rematch:{game_id}"
+            )
+        ]])
+
     if game["type"] == "ttt":
         buttons = [InlineKeyboardButton(
             text=game["board"][i] or "·",
@@ -5700,6 +5708,72 @@ def pvp_callback_in_game_chat(callback: CallbackQuery, game) -> bool:
             and getattr(message, "business_connection_id", None) == game["connection_id"]
         )
     return True
+
+
+@dp.callback_query(lambda c: c.data.startswith("pvp_rematch:"))
+async def pvp_rematch(callback: CallbackQuery):
+    try:
+        _, game_id = callback.data.split(":", 1)
+        game = active_games[game_id]
+    except (ValueError, KeyError):
+        await callback.answer("Игра не найдена.", show_alert=True)
+        return
+
+    if (
+        game.get("location") != "business"
+        or not pvp_callback_in_game_chat(callback, game)
+    ):
+        await callback.answer("Реванш доступен в переписке, где проходила игра.", show_alert=True)
+        return
+    if callback.from_user.id not in (game["creator_id"], game["opponent_id"]):
+        await callback.answer("Ты не участник этой игры.", show_alert=True)
+        return
+    if not game["finished"]:
+        await callback.answer("Сначала нужно закончить текущую игру.")
+        return
+
+    creator_id = game["creator_id"]
+    opponent_id = game["opponent_id"]
+    round_number = game.get("round_number", 1) + 1
+    # Меняем первого игрока местами после каждой партии.
+    first_player, second_player = (
+        (opponent_id, creator_id) if round_number % 2 == 0
+        else (creator_id, opponent_id)
+    )
+    next_game = new_pvp_game_state(
+        game["type"],
+        first_player,
+        second_player,
+        location="business",
+        connection_id=game["connection_id"],
+        chat_id=game["chat_id"],
+        message_id=game["message_id"],
+        round_number=round_number
+    )
+    next_game["creator_id"] = creator_id
+    next_game["opponent_id"] = opponent_id
+    next_game["player_labels"] = game["player_labels"]
+    active_games[game_id] = next_game
+
+    try:
+        await bot.edit_message_text(
+            business_connection_id=next_game["connection_id"],
+            chat_id=next_game["chat_id"],
+            message_id=next_game["message_id"],
+            text=_pvp_business_game_text(next_game),
+            reply_markup=_pvp_game_keyboard(game_id, next_game, first_player)
+        )
+    except Exception:
+        active_games[game_id] = game
+        logger.exception("Could not start PvP rematch: game_id=%s", game_id)
+        await callback.answer("Не удалось запустить реванш. Попробуй ещё раз.", show_alert=True)
+        return
+
+    logger.info(
+        "PvP rematch started: game_id=%s game_type=%s round=%s players=%s,%s",
+        game_id, game["type"], round_number, creator_id, opponent_id
+    )
+    await callback.answer("Реванш начался! Первый ход у другого игрока.")
 
 
 @dp.callback_query(lambda c: c.data.startswith("pvp_tt:"))
@@ -7560,7 +7634,7 @@ async def command_games_help(callback: CallbackQuery):
         "⭕ <b>.ttt</b> — крестики-нолики\n"
         "✊ <b>.rps</b> — камень, ножницы, бумага\n"
         "🔴 <b>.c4</b> — четыре в ряд.\n"
-        "Игровые команды удаляются после обработки, приглашение и поле остаются.\n\n"
+        "Игровые команды удаляются после обработки, приглашение и поле остаются. После партии нажмите «Реванш», чтобы начать следующую; первый ход перейдёт другому игроку.\n\n"
         "Отправь команду прямо в личном Business-чате с нужным соперником. Приглашение и общее игровое поле появятся в этой переписке. Собеседник принимает вызов кнопкой, затем вы ходите по очереди. В личном чате с ботом команды подскажут, куда их отправить.",
         back_keyboard("open_commands", "⬅️ К командам")
     )
