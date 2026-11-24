@@ -2,16 +2,18 @@ import asyncio
 import difflib
 import html
 import logging
+import math
 import os
 import random
 import sqlite3
-from io import StringIO
+from io import BytesIO, StringIO
 import uuid
 import shutil
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from logging.handlers import RotatingFileHandler
 import qrcode
+from PIL import Image, ImageDraw
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
 from aiogram.types import (
@@ -599,6 +601,7 @@ db.commit()
 active_spam_tasks = {}
 game_invites = {}
 active_games = {}
+game_command_delete_warnings = set()
 subscription_notice_sent = set()
 
 
@@ -3963,19 +3966,21 @@ async def business_message_handler(
             ".c4": "c4"
         }
         if command_text in game_commands:
+            await delete_game_command_message(message)
             await create_business_game_invite(
                 message,
                 game_commands[command_text]
             )
             return
         if command_text == ".flip":
-            await bot.send_message(
+            await delete_game_command_message(message)
+            await send_coin_flip(
                 chat_id=message.chat.id,
-                business_connection_id=message.business_connection_id,
-                text=random.choice(("🪙 Орёл!", "🪙 Решка!"))
+                business_connection_id=message.business_connection_id
             )
             return
         if command_text == ".dice":
+            await delete_game_command_message(message)
             await bot.send_dice(
                 chat_id=message.chat.id,
                 business_connection_id=message.business_connection_id,
@@ -5018,6 +5023,140 @@ async def handle_group_spam_command(message: types.Message, command, args):
 # =========================================================
 
 
+async def delete_game_command_message(message) -> bool:
+    try:
+        connection_id = getattr(message, "business_connection_id", None)
+        if connection_id:
+            await bot.delete_business_messages(
+                business_connection_id=connection_id,
+                message_ids=[message.message_id]
+            )
+        else:
+            await message.delete()
+        return True
+    except Exception as error:
+        logger.warning(
+            "Could not remove game command: chat_id=%s message_id=%s error=%s",
+            getattr(getattr(message, "chat", None), "id", None),
+            getattr(message, "message_id", None),
+            error
+        )
+        connection_id = getattr(message, "business_connection_id", None)
+        owner_id = getattr(getattr(message, "from_user", None), "id", None)
+        if connection_id and owner_id and owner_id not in game_command_delete_warnings:
+            game_command_delete_warnings.add(owner_id)
+            try:
+                await bot.send_message(
+                    chat_id=owner_id,
+                    text=(
+                        "ℹ️ Игровая команда не удалилась из Business-чата. "
+                        "В Telegram Business → Чат-боты включи для бота право "
+                        "«Удалять все сообщения» — тогда останется только ответ или игровое поле."
+                    )
+                )
+            except Exception:
+                logger.exception("Could not notify owner about game command delete permission: user_id=%s", owner_id)
+        return False
+
+
+def create_coin_flip_gif(result: str) -> bytes:
+    width, height = 240, 180
+    frame_count = 24
+    frames = []
+
+    def draw_star(draw, center_x, center_y, radius, color):
+        points = []
+        for index in range(10):
+            angle = -math.pi / 2 + index * math.pi / 5
+            point_radius = radius if index % 2 == 0 else radius * 0.43
+            points.append((
+                center_x + math.cos(angle) * point_radius,
+                center_y + math.sin(angle) * point_radius
+            ))
+        draw.polygon(points, fill=color)
+
+    for index in range(frame_count):
+        progress = index / (frame_count - 1)
+        angle = 10 * math.pi * progress + 3 * math.pi * progress * (1 - progress)
+        final_pose = progress >= 0.88
+        coin_width = 116 if final_pose else max(8, int(116 * abs(math.cos(angle))))
+        face = result if final_pose else ("Орёл" if math.cos(angle) >= 0 else "Решка")
+
+        frame = Image.new("RGB", (width, height), "#111a27")
+        draw = ImageDraw.Draw(frame)
+        draw.ellipse((55, 145, 185, 163), fill="#080d14")
+
+        left = (width - coin_width) // 2
+        right = left + coin_width
+        top, bottom = 25, 145
+        draw.ellipse((left, top, right, bottom), fill="#9c6418", outline="#f9d76c", width=4)
+
+        if coin_width > 26:
+            inset = max(3, min(10, coin_width // 10))
+            draw.ellipse(
+                (left + inset, top + 8, right - inset, bottom - 8),
+                fill="#e7ae35",
+                outline="#fff0ad",
+                width=2
+            )
+            center_x = width // 2
+            center_y = (top + bottom) // 2
+            dark_gold = "#8a5713"
+            if face == "Орёл":
+                draw.ellipse((center_x - 20, center_y - 30, center_x + 13, center_y + 9), fill=dark_gold)
+                draw.polygon(
+                    [(center_x + 5, center_y - 7), (center_x + 25, center_y + 1), (center_x + 7, center_y + 8)],
+                    fill=dark_gold
+                )
+                draw.pieslice(
+                    (center_x - 34, center_y + 2, center_x + 30, center_y + 46),
+                    180, 360, fill=dark_gold
+                )
+            else:
+                draw.ellipse(
+                    (center_x - 27, center_y - 27, center_x + 27, center_y + 27),
+                    outline=dark_gold,
+                    width=3
+                )
+                draw_star(draw, center_x, center_y, 23, dark_gold)
+
+        frames.append(frame)
+
+    output = BytesIO()
+    frames[0].save(
+        output,
+        format="GIF",
+        save_all=True,
+        append_images=frames[1:],
+        duration=[65] * (frame_count - 1) + [1100],
+        disposal=2,
+        optimize=True
+    )
+    return output.getvalue()
+
+
+async def send_coin_flip(chat_id: int, business_connection_id=None):
+    result = random.choice(("Орёл", "Решка"))
+    animation = BufferedInputFile(
+        create_coin_flip_gif(result),
+        filename="coin-flip.gif"
+    )
+    try:
+        await bot.send_animation(
+            chat_id=chat_id,
+            business_connection_id=business_connection_id,
+            animation=animation,
+            caption=f"🪙 {result}!"
+        )
+    except Exception:
+        logger.exception("Coin animation send failed: chat_id=%s", chat_id)
+        await bot.send_message(
+            chat_id=chat_id,
+            business_connection_id=business_connection_id,
+            text=f"🪙 {result}!"
+        )
+
+
 def ttt_winner(board):
     for a, b, c in ((0,1,2),(3,4,5),(6,7,8),(0,3,6),(1,4,7),(2,5,8),(0,4,8),(2,4,6)):
         if board[a] and board[a] == board[b] == board[c]:
@@ -5033,7 +5172,8 @@ def ttt_winner(board):
     )
 )
 async def flip_command(message: types.Message):
-    await message.answer(random.choice(("🪙 Орёл!", "🪙 Решка!")))
+    await delete_game_command_message(message)
+    await send_coin_flip(chat_id=message.chat.id)
 
 
 @dp.message(
@@ -5044,6 +5184,7 @@ async def flip_command(message: types.Message):
     )
 )
 async def dice_command(message: types.Message):
+    await delete_game_command_message(message)
     await bot.send_dice(chat_id=message.chat.id, emoji="🎲")
 
 
@@ -5055,6 +5196,7 @@ async def dice_command(message: types.Message):
     )
 )
 async def business_game_help(message: types.Message):
+    await delete_game_command_message(message)
     await message.answer(
         "Чтобы сыграть с собеседником, отправь команду прямо в личном Business-чате с ним. "
         "Приглашение и игровое поле появятся в этой переписке."
@@ -6388,7 +6530,8 @@ async def connect_business(
         "<b>Настройки → Telegram Business → Чат-боты</b>\n\n"
 
         "Добавь этого бота и выдай права на чтение и отправку сообщений. "
-        "Для команды .mute также включи право «Удалять все сообщения».\n\n"
+        "Чтобы бот удалял игровые команды и работал .mute, включи право "
+        "«Удалять все сообщения».\n\n"
 
         "После подключения архивирование "
         "начнёт работать автоматически.",
@@ -7416,7 +7559,8 @@ async def command_games_help(callback: CallbackQuery):
         "♟ <b>.chk</b> — пригласить игрока в шашки\n"
         "⭕ <b>.ttt</b> — крестики-нолики\n"
         "✊ <b>.rps</b> — камень, ножницы, бумага\n"
-        "🔴 <b>.c4</b> — четыре в ряд.\n\n"
+        "🔴 <b>.c4</b> — четыре в ряд.\n"
+        "Игровые команды удаляются после обработки, приглашение и поле остаются.\n\n"
         "Отправь команду прямо в личном Business-чате с нужным соперником. Приглашение и общее игровое поле появятся в этой переписке. Собеседник принимает вызов кнопкой, затем вы ходите по очереди. В личном чате с ботом команды подскажут, куда их отправить.",
         back_keyboard("open_commands", "⬅️ К командам")
     )
