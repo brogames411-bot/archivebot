@@ -1327,7 +1327,7 @@ def commands_keyboard():
             ],
             [
                 InlineKeyboardButton(
-                    text="🎮 .chk / .ttt",
+                    text="🎮 Игры",
                     callback_data="command_games"
                 )
             ],
@@ -2724,9 +2724,11 @@ async def video_to_circle(
     callback: CallbackQuery
 ):
 
+    audio_converter_users.discard(callback.from_user.id)
     converter_users.add(
         callback.from_user.id
     )
+    logger.info("Video-to-circle mode enabled: user_id=%s", callback.from_user.id)
 
     await replace_menu(
         callback,
@@ -2757,6 +2759,7 @@ async def cancel_converter(
     converter_users.discard(
         callback.from_user.id
     )
+    audio_converter_users.discard(callback.from_user.id)
 
     await show_main_menu(
         owner_id=callback.from_user.id,
@@ -2786,9 +2789,11 @@ async def video_to_audio(
     callback: CallbackQuery
 ):
 
+    converter_users.discard(callback.from_user.id)
     audio_converter_users.add(
         callback.from_user.id
     )
+    logger.info("Video-to-audio mode enabled: user_id=%s", callback.from_user.id)
 
     await replace_menu(
         callback,
@@ -2813,6 +2818,7 @@ async def cancel_audio_converter(
     audio_converter_users.discard(
         callback.from_user.id
     )
+    converter_users.discard(callback.from_user.id)
 
     await show_main_menu(
         owner_id=callback.from_user.id,
@@ -2831,7 +2837,14 @@ async def cancel_audio_converter(
         pass
 
 
-@dp.message(F.chat.type == "private", F.video)
+@dp.message(
+    lambda message: (
+        message.chat.type == "private"
+        and message.video is not None
+        and message.from_user is not None
+        and message.from_user.id in audio_converter_users
+    )
+)
 async def extract_audio_handler(
     message: types.Message
 ):
@@ -3036,8 +3049,12 @@ async def extract_audio_handler(
 # =========================================================
 
 @dp.message(
-    F.chat.type == "private",
-    F.video
+    lambda message: (
+        message.chat.type == "private"
+        and message.video is not None
+        and message.from_user is not None
+        and message.from_user.id in converter_users
+    )
 )
 async def convert_video_handler(
     message: types.Message
@@ -3049,6 +3066,14 @@ async def convert_video_handler(
 
     if user_id not in converter_users:
         return
+
+    logger.info(
+        "Video received for circle conversion: user_id=%s message_id=%s duration=%s file_size=%s",
+        user_id,
+        message.message_id,
+        getattr(message.video, "duration", None),
+        getattr(message.video, "file_size", None)
+    )
 
     converter_users.discard(
         user_id
@@ -3063,12 +3088,18 @@ async def convert_video_handler(
     # Проверка FFmpeg
     # -----------------------------------------------------
 
-    if not os.path.isfile(
+    actual_ffmpeg = (
         FFMPEG_PATH
-    ):
+        if os.path.isfile(FFMPEG_PATH)
+        else shutil.which(FFMPEG_PATH)
+    )
+
+    if not actual_ffmpeg:
 
         await message.answer(
             "❌ <b>FFmpeg не найден.</b>\n\n"
+            "Установи FFmpeg на сервер или укажи путь в переменной "
+            "<code>FFMPEG_PATH</code>.\n\n"
             f"<code>{safe(FFMPEG_PATH)}</code>",
             parse_mode="HTML"
         )
@@ -3165,25 +3196,27 @@ async def convert_video_handler(
         # FFMPEG
         # -------------------------------------------------
 
-        actual_ffmpeg = (
-            FFMPEG_PATH
-            if os.path.isfile(FFMPEG_PATH)
-            else shutil.which(FFMPEG_PATH)
-        )
-
-        if not actual_ffmpeg:
-            raise RuntimeError(
-                "FFmpeg не установлен на сервере."
-            )
-
         ffmpeg_command = [
 
             actual_ffmpeg,
 
             "-y",
 
+            "-nostdin",
+
+            "-hide_banner",
+
+            "-loglevel",
+            "error",
+
             "-i",
             input_file,
+
+            "-map",
+            "0:v:0",
+
+            "-map",
+            "0:a:0?",
 
             "-vf",
             (
@@ -3244,9 +3277,18 @@ async def convert_video_handler(
             )
         )
 
-        stdout, stderr = (
-            await process.communicate()
-        )
+        try:
+            stdout, stderr = await asyncio.wait_for(
+                process.communicate(),
+                timeout=180
+            )
+        except asyncio.TimeoutError:
+            process.kill()
+            try:
+                await process.communicate()
+            except Exception:
+                pass
+            raise RuntimeError("FFmpeg слишком долго обрабатывал видео. Попробуй ролик покороче или с меньшим разрешением.")
 
         if process.returncode != 0:
 
@@ -3914,10 +3956,16 @@ async def business_message_handler(
     # Игры доступны владельцу в личном Business-чате, а также в обычном
     # личном чате с ботом. PvP создаётся именно в чате с соперником.
     if message.chat.type == "private" and user_id == owner_id:
-        if command_text in {".ttt", ".chk"}:
+        game_commands = {
+            ".ttt": "ttt",
+            ".chk": "chk",
+            ".rps": "rps",
+            ".c4": "c4"
+        }
+        if command_text in game_commands:
             await create_business_game_invite(
                 message,
-                "ttt" if command_text == ".ttt" else "chk"
+                game_commands[command_text]
             )
             return
         if command_text == ".flip":
@@ -4999,10 +5047,16 @@ async def dice_command(message: types.Message):
     await bot.send_dice(chat_id=message.chat.id, emoji="🎲")
 
 
-@dp.message(F.chat.type == "private", F.text == ".ttt")
-async def ttt_command(message: types.Message):
+@dp.message(
+    lambda message: (
+        message.chat.type == "private"
+        and isinstance(message.text, str)
+        and message.text.strip().casefold() in {".ttt", ".chk", ".rps", ".c4"}
+    )
+)
+async def business_game_help(message: types.Message):
     await message.answer(
-        "Чтобы сыграть с собеседником, отправь .ttt прямо в личном Business-чате с ним. "
+        "Чтобы сыграть с собеседником, отправь команду прямо в личном Business-чате с ним. "
         "Приглашение и игровое поле появятся в этой переписке."
     )
 
@@ -5059,14 +5113,6 @@ def _checkers_over(board, turn):
     return "", False
 
 
-@dp.message(F.chat.type == "private", F.text == ".chk")
-async def checkers_command(message: types.Message):
-    await message.answer(
-        "Чтобы сыграть с собеседником, отправь .chk прямо в личном Business-чате с ним. "
-        "Приглашение и игровое поле появятся в этой переписке."
-    )
-
-
 # =========================================================
 # PLAYER-TO-PLAYER GAMES
 # =========================================================
@@ -5080,6 +5126,7 @@ async def create_game_invite(message: types.Message, game_type: str):
     game_invites[invite_id] = {
         "type": game_type,
         "creator_id": message.from_user.id,
+        "creator_label": game_user_label(message.from_user, message.from_user.id),
         "created_at": datetime.now(timezone.utc).timestamp()
     }
     logger.info(
@@ -5095,6 +5142,16 @@ async def create_game_invite(message: types.Message, game_type: str):
             InlineKeyboardButton(text="📨 Пригласить соперника", url=invite_url)
         ]])
     )
+
+
+def game_user_label(user, fallback_id=None):
+    username = getattr(user, "username", None)
+    if username:
+        return f"@{username}"
+    first_name = getattr(user, "first_name", None)
+    last_name = getattr(user, "last_name", None)
+    display_name = " ".join(part for part in (first_name, last_name) if part)
+    return display_name or f"ID {fallback_id or 'неизвестен'}"
 
 
 async def create_business_game_invite(message: types.Message, game_type: str):
@@ -5120,15 +5177,25 @@ async def create_business_game_invite(message: types.Message, game_type: str):
         "connection_id": connection_id,
         "chat_id": message.chat.id,
         "location": "business",
+        "creator_label": game_user_label(message.from_user, creator_id),
+        "opponent_label": game_user_label(message.chat, opponent_id),
         "created_at": datetime.now(timezone.utc).timestamp()
     }
     game_invites[invite_id] = invite
-    title = "крестики-нолики" if game_type == "ttt" else "шашки"
+    title = {
+        "ttt": "крестики-нолики",
+        "chk": "шашки",
+        "rps": "камень, ножницы, бумага",
+        "c4": "четыре в ряд"
+    }[game_type]
     try:
         sent = await bot.send_message(
             chat_id=message.chat.id,
             business_connection_id=connection_id,
-            text=f"🎮 Вызов на {title}! Нажми кнопку, чтобы сыграть против владельца аккаунта.",
+            text=(
+                f"🎮 {invite['creator_label']} вызывает тебя на игру «{title}»! "
+                "Нажми кнопку, чтобы принять вызов."
+            ),
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
                 InlineKeyboardButton(
                     text="✅ Принять вызов",
@@ -5163,11 +5230,22 @@ def new_pvp_game_state(game_type: str, creator_id: int, opponent_id: int, **extr
             "board": [None] * 9, "turn": "X", "finished": False,
             "status": "", "message_ids": {}
         }
-    else:
+    elif game_type == "chk":
         game = {
             "type": "chk", "players": {"w": creator_id, "b": opponent_id},
             "board": _pvp_checkers_board(), "turn": "w", "finished": False,
             "status": "", "selected": None, "selected_by": None, "message_ids": {}
+        }
+    elif game_type == "rps":
+        game = {
+            "type": "rps", "players": {"creator": creator_id, "opponent": opponent_id},
+            "choices": {}, "finished": False, "status": "", "message_ids": {}
+        }
+    else:
+        game = {
+            "type": "c4", "players": {"R": creator_id, "Y": opponent_id},
+            "board": [[None for _ in range(7)] for _ in range(6)],
+            "turn": "R", "finished": False, "status": "", "message_ids": {}
         }
     game.update(extra)
     return game
@@ -5186,33 +5264,75 @@ def _pvp_checkers_board():
     return board
 
 
+def _connect4_has_winner(board, row, column, token):
+    for row_step, column_step in ((0, 1), (1, 0), (1, 1), (1, -1)):
+        count = 1
+        for direction in (-1, 1):
+            r, c = row, column
+            while True:
+                r += row_step * direction
+                c += column_step * direction
+                if not (0 <= r < 6 and 0 <= c < 7) or board[r][c] != token:
+                    break
+                count += 1
+        if count >= 4:
+            return True
+    return False
+
+
 def _pvp_game_text(game, user_id):
     if game["type"] == "ttt":
         mark = "X" if game["players"]["X"] == user_id else "O"
+        current_player = game["players"][game["turn"]]
         status = game["status"] if game["finished"] else (
-            "Твой ход." if game["players"][game["turn"]] == user_id else "Ход соперника."
+            f"Ход: {_pvp_player_label(game, current_player)}."
         )
         return f"⭕ Крестики-нолики PvP\nТы играешь за {mark}. {status}"
     side = "w" if game["players"]["w"] == user_id else "b"
+    current_player = game["players"][game["turn"]]
     status = game["status"] if game["finished"] else (
-        "Твой ход." if game["players"][game["turn"]] == user_id else "Ход соперника."
+        f"Ход: {_pvp_player_label(game, current_player)}."
     )
     return f"♟ Шашки PvP\nТы играешь {'белыми' if side == 'w' else 'чёрными'}. {status}"
 
 
+def _pvp_player_label(game, user_id):
+    return game.get("player_labels", {}).get(user_id, f"ID {user_id}")
+
+
+def _pvp_turn_notice(game):
+    current_player = game["players"][game["turn"]]
+    return f"Сейчас ход: {_pvp_player_label(game, current_player)}."
+
+
 def _pvp_business_game_text(game):
     if game["type"] == "ttt":
-        turn_owner = game["players"][game["turn"]] == game["creator_id"]
-        status = game["status"] if game["finished"] else (
-            "Ход владельца аккаунта." if turn_owner else "Ход собеседника."
-        )
+        current_player = game["players"][game["turn"]]
+        status = game["status"] if game["finished"] else f"Ход: {_pvp_player_label(game, current_player)}."
         return f"⭕ Крестики-нолики — игра один на один\n{status}"
 
-    turn_owner = game["players"][game["turn"]] == game["creator_id"]
-    status = game["status"] if game["finished"] else (
-        "Ход владельца аккаунта." if turn_owner else "Ход собеседника."
-    )
-    return f"♟ Шашки — игра один на один\n{status}"
+    if game["type"] == "chk":
+        current_player = game["players"][game["turn"]]
+        status = game["status"] if game["finished"] else f"Ход: {_pvp_player_label(game, current_player)}."
+        return f"♟ Шашки — игра один на один\n{status}"
+
+    if game["type"] == "rps":
+        if game["finished"]:
+            status = game["status"]
+        else:
+            waiting = [
+                _pvp_player_label(game, user_id)
+                for user_id in (game["creator_id"], game["opponent_id"])
+                if user_id not in game["choices"]
+            ]
+            status = "Ждём выбор: " + ", ".join(waiting) + "."
+        return f"✊ Камень, ножницы, бумага\n{status}"
+
+    current_player = game["players"][game["turn"]]
+    status = game["status"] if game["finished"] else f"Ход: {_pvp_player_label(game, current_player)}."
+    pieces = {"R": "🔴", "Y": "🟡", None: "⚪"}
+    board_text = "\n".join("".join(pieces[cell] for cell in row) for row in game["board"])
+    return f"🔴 Четыре в ряд 🟡\n{board_text}\n{status}"
 
 
 def _pvp_game_keyboard(game_id, game, user_id):
@@ -5224,6 +5344,29 @@ def _pvp_game_keyboard(game_id, game, user_id):
             else "pvp_noop"
         ) for i in range(9)]
         return InlineKeyboardMarkup(inline_keyboard=[buttons[i:i + 3] for i in range(0, 9, 3)])
+
+    if game["type"] == "rps":
+        choices = (("rock", "✊ Камень"), ("scissors", "✌️ Ножницы"), ("paper", "✋ Бумага"))
+        return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(
+            text=label,
+            callback_data=f"pvp_rps:{game_id}:{choice}"
+            if not game["finished"]
+            else "pvp_noop"
+        ) for choice, label in choices]])
+
+    if game["type"] == "c4":
+        top_row = [InlineKeyboardButton(
+            text=f"⬇️ {column + 1}",
+            callback_data=f"pvp_c4:{game_id}:{column}"
+            if not game["finished"]
+            else "pvp_noop"
+        ) for column in range(7)]
+        pieces = {"R": "🔴", "Y": "🟡", None: "⚪"}
+        board_rows = [[InlineKeyboardButton(
+            text=pieces[cell],
+            callback_data="pvp_noop"
+        ) for cell in row] for row in game["board"]]
+        return InlineKeyboardMarkup(inline_keyboard=[top_row, *board_rows])
 
     symbols = {"w": "⚪", "W": "🔵", "b": "⚫", "B": "🔴"}
     selected = game["selected"] if (
@@ -5298,6 +5441,10 @@ async def accept_game_invite(message: types.Message, invite_id: str):
     game = new_pvp_game_state(
         invite["type"], creator_id, opponent_id, location="private"
     )
+    game["player_labels"] = {
+        creator_id: invite.get("creator_label", f"ID {creator_id}"),
+        opponent_id: game_user_label(message.from_user, opponent_id)
+    }
 
     active_games[game_id] = game
     game_invites.pop(invite_id, None)
@@ -5366,6 +5513,11 @@ async def accept_business_game_invite(callback: CallbackQuery):
         message_id=board_message.message_id
     )
     game["creator_id"] = creator_id
+    game["opponent_id"] = opponent_id
+    game["player_labels"] = {
+        creator_id: invite["creator_label"],
+        opponent_id: invite["opponent_label"]
+    }
     active_games[game_id] = game
 
     try:
@@ -5422,7 +5574,7 @@ async def pvp_ttt_move(callback: CallbackQuery):
         return
     mark = "X" if game["players"]["X"] == callback.from_user.id else "O" if game["players"]["O"] == callback.from_user.id else None
     if game["finished"] or mark != game["turn"]:
-        await callback.answer("Сейчас ход соперника.")
+        await callback.answer(_pvp_turn_notice(game))
         return
     if not 0 <= pos < 9 or game["board"][pos]:
         await callback.answer("Клетка занята.")
@@ -5430,11 +5582,113 @@ async def pvp_ttt_move(callback: CallbackQuery):
     game["board"][pos] = mark
     winner = ttt_winner(game["board"])
     if winner:
-        game["finished"], game["status"] = True, f"Победили {'крестики' if winner == 'X' else 'нолики'}!"
+        if game.get("player_labels"):
+            winner_id = game["players"][winner]
+            game["status"] = f"Победил {_pvp_player_label(game, winner_id)} ({'крестики' if winner == 'X' else 'нолики'})!"
+            game["finished"] = True
+        else:
+            game["finished"], game["status"] = True, f"Победили {'крестики' if winner == 'X' else 'нолики'}!"
     elif all(game["board"]):
         game["finished"], game["status"] = True, "Ничья!"
     else:
         game["turn"] = "O" if mark == "X" else "X"
+    await _refresh_pvp_game(game_id)
+    await callback.answer()
+
+
+@dp.callback_query(lambda c: c.data.startswith("pvp_rps:"))
+async def pvp_rps_move(callback: CallbackQuery):
+    try:
+        _, game_id, choice = callback.data.split(":")
+        game = active_games[game_id]
+    except (ValueError, KeyError):
+        await callback.answer("Игра не найдена.", show_alert=True)
+        return
+
+    if game.get("type") != "rps" or not pvp_callback_in_game_chat(callback, game):
+        await callback.answer("Игра доступна только в своей личной переписке.", show_alert=True)
+        return
+    if choice not in {"rock", "scissors", "paper"}:
+        await callback.answer("Неизвестный выбор.", show_alert=True)
+        return
+    if callback.from_user.id not in (game["creator_id"], game["opponent_id"]):
+        await callback.answer("Ты не участник этой игры.", show_alert=True)
+        return
+    if game["finished"]:
+        await callback.answer("Игра уже завершена.")
+        return
+    if callback.from_user.id in game["choices"]:
+        await callback.answer("Ты уже сделал выбор.")
+        return
+
+    game["choices"][callback.from_user.id] = choice
+    if len(game["choices"]) == 2:
+        creator_choice = game["choices"][game["creator_id"]]
+        opponent_choice = game["choices"][game["opponent_id"]]
+        choice_names = {"rock": "камень", "scissors": "ножницы", "paper": "бумагу"}
+        reveal = (
+            f"{_pvp_player_label(game, game['creator_id'])}: {choice_names[creator_choice]}; "
+            f"{_pvp_player_label(game, game['opponent_id'])}: {choice_names[opponent_choice]}. "
+        )
+        if creator_choice == opponent_choice:
+            game["status"] = f"Ничья! {reveal}"
+        else:
+            beats = {"rock": "scissors", "scissors": "paper", "paper": "rock"}
+            winner_id = (
+                game["creator_id"]
+                if beats[creator_choice] == opponent_choice
+                else game["opponent_id"]
+            )
+            game["status"] = f"Победил {_pvp_player_label(game, winner_id)}! {reveal}"
+        game["finished"] = True
+
+    await _refresh_pvp_game(game_id)
+    await callback.answer("Выбор принят.")
+
+
+@dp.callback_query(lambda c: c.data.startswith("pvp_c4:"))
+async def pvp_connect4_move(callback: CallbackQuery):
+    try:
+        _, game_id, column_text = callback.data.split(":")
+        column = int(column_text)
+        game = active_games[game_id]
+    except (ValueError, KeyError):
+        await callback.answer("Игра не найдена.", show_alert=True)
+        return
+
+    if game.get("type") != "c4" or not pvp_callback_in_game_chat(callback, game):
+        await callback.answer("Игра доступна только в своей личной переписке.", show_alert=True)
+        return
+    if callback.from_user.id not in game["players"].values():
+        await callback.answer("Ты не участник этой игры.", show_alert=True)
+        return
+    if game["finished"]:
+        await callback.answer("Игра уже завершена.")
+        return
+    if game["players"][game["turn"]] != callback.from_user.id:
+        await callback.answer(_pvp_turn_notice(game))
+        return
+    if not 0 <= column < 7:
+        await callback.answer("Некорректный столбец.", show_alert=True)
+        return
+
+    row = next((r for r in range(5, -1, -1) if game["board"][r][column] is None), None)
+    if row is None:
+        await callback.answer("Столбец заполнен.")
+        return
+
+    token = game["turn"]
+    game["board"][row][column] = token
+    if _connect4_has_winner(game["board"], row, column, token):
+        winner_id = game["players"][token]
+        game["status"] = f"Победил {_pvp_player_label(game, winner_id)}!"
+        game["finished"] = True
+    elif all(cell is not None for board_row in game["board"] for cell in board_row):
+        game["status"] = "Ничья! Поле заполнено."
+        game["finished"] = True
+    else:
+        game["turn"] = "Y" if token == "R" else "R"
+
     await _refresh_pvp_game(game_id)
     await callback.answer()
 
@@ -5453,7 +5707,7 @@ async def pvp_checkers_move(callback: CallbackQuery):
         return
     side = game["turn"]
     if game["finished"] or game["players"][side] != callback.from_user.id:
-        await callback.answer("Сейчас ход соперника.")
+        await callback.answer(_pvp_turn_notice(game))
         return
     if not (0 <= r < 8 and 0 <= c < 8):
         await callback.answer("Некорректная клетка.", show_alert=True)
@@ -5482,7 +5736,18 @@ async def pvp_checkers_move(callback: CallbackQuery):
     game["turn"] = "b" if side == "w" else "w"
     winner, finished = _checkers_over(board, game["turn"])
     if finished:
-        game["finished"], game["status"] = True, winner
+        if game.get("player_labels"):
+            if not any(cell and cell.lower() == "w" for board_row in board for cell in board_row):
+                winning_side = "b"
+            elif not any(cell and cell.lower() == "b" for board_row in board for cell in board_row):
+                winning_side = "w"
+            else:
+                winning_side = "b" if game["turn"] == "w" else "w"
+            winner_id = game["players"][winning_side]
+            game["status"] = f"Победил {_pvp_player_label(game, winner_id)}! {winner}"
+            game["finished"] = True
+        else:
+            game["finished"], game["status"] = True, winner
     await _refresh_pvp_game(game_id)
     await callback.answer()
 
@@ -7149,7 +7414,9 @@ async def command_games_help(callback: CallbackQuery):
     await replace_menu(
         callback,
         "♟ <b>.chk</b> — пригласить игрока в шашки\n"
-        "⭕ <b>.ttt</b> — пригласить игрока в крестики-нолики.\n\n"
+        "⭕ <b>.ttt</b> — крестики-нолики\n"
+        "✊ <b>.rps</b> — камень, ножницы, бумага\n"
+        "🔴 <b>.c4</b> — четыре в ряд.\n\n"
         "Отправь команду прямо в личном Business-чате с нужным соперником. Приглашение и общее игровое поле появятся в этой переписке. Собеседник принимает вызов кнопкой, затем вы ходите по очереди. В личном чате с ботом команды подскажут, куда их отправить.",
         back_keyboard("open_commands", "⬅️ К командам")
     )
