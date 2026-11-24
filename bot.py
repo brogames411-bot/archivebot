@@ -1558,6 +1558,51 @@ async def show_main_menu(
 # REPLACE CURRENT MENU SCREEN
 # =========================================================
 
+async def send_menu_photo(chat_id, photo_path, caption, keyboard):
+    """Upload a menu image from memory and retry one transient network failure."""
+    try:
+        with open(photo_path, "rb") as photo_file:
+            photo_bytes = photo_file.read()
+    except OSError:
+        logger.exception("Не удалось прочитать фото меню: %s", photo_path)
+        return None
+
+    if not photo_bytes:
+        logger.error("Файл фото меню пустой: %s", photo_path)
+        return None
+
+    for attempt in range(2):
+        try:
+            return await bot.send_photo(
+                chat_id=chat_id,
+                photo=BufferedInputFile(
+                    photo_bytes,
+                    filename=os.path.basename(photo_path)
+                ),
+                caption=caption,
+                parse_mode="HTML",
+                reply_markup=keyboard
+            )
+        except TelegramNetworkError as error:
+            if attempt == 0:
+                logger.warning(
+                    "Сбой загрузки фото меню (%r); повтор через 1 секунду",
+                    error
+                )
+                await asyncio.sleep(1)
+            else:
+                logger.exception(
+                    "Повторная отправка фото меню не удалась: path=%s size=%s",
+                    photo_path,
+                    len(photo_bytes)
+                )
+        except Exception:
+            logger.exception("Telegram отклонил фото меню")
+            return None
+
+    return None
+
+
 async def replace_menu(
     callback: CallbackQuery,
     text,
@@ -1574,19 +1619,14 @@ async def replace_menu(
 
     try:
         if photo:
-            try:
-                new_message = await bot.send_photo(
-                    chat_id=old_chat_id,
-                    photo=FSInputFile(photo),
-                    caption=text,
-                    parse_mode="HTML",
-                    reply_markup=keyboard
-                )
-            except Exception as error:
-                logger.exception(
-                    "Не удалось отправить фото меню (%r); пробую отправить текст",
-                    error
-                )
+            new_message = await send_menu_photo(
+                chat_id=old_chat_id,
+                photo_path=photo,
+                caption=text,
+                keyboard=keyboard
+            )
+            if new_message is None:
+                logger.warning("Фото меню не отправлено; пробую отправить текст")
                 new_message = await bot.send_message(
                     chat_id=old_chat_id,
                     text=text,
