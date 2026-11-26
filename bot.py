@@ -6187,8 +6187,22 @@ async def cancel_qr(
     await callback.answer(
         "Создание QR отменено."
     )
-async def forward_replied_message_to_replier(message: types.Message) -> bool:
+async def forward_replied_message_to_replier(
+    message: types.Message,
+    owner_id: int
+) -> bool:
     """Отправляет автору ответа медиа в его личный чат с ботом."""
+
+    if not is_subscription_active(owner_id):
+        await notify_subscription_required(owner_id)
+        logger.info(
+            "Business reply media forwarding skipped without subscription: "
+            "owner_id=%s chat_id=%s message_id=%s",
+            owner_id,
+            message.chat.id,
+            message.message_id
+        )
+        return False
 
     if not reply_archive_recipient_id(message):
         logger.error("Reply author Bot chat unavailable: business_chat_id=%s", message.chat.id)
@@ -8137,7 +8151,7 @@ async def business_message_handler(
         or getattr(message, "quote", None)
     ):
         try:
-            await forward_replied_message_to_replier(message)
+            await forward_replied_message_to_replier(message, owner_id)
         except Exception:
             logger.exception(
                 "Business reply media forwarding failed: chat_id=%s message_id=%s",
@@ -8161,12 +8175,23 @@ async def edited_business_message_handler(
     if connection is None:
         return
 
+    owner_id = connection.user.id
+    if not is_subscription_active(owner_id):
+        await notify_subscription_required(owner_id)
+        logger.info(
+            "Edited Business message skipped without subscription: "
+            "owner_id=%s chat_id=%s message_id=%s",
+            owner_id,
+            message.chat.id,
+            message.message_id
+        )
+        return
+
     save_connection(
         connection,
         last_chat_id=message.chat.id
     )
 
-    owner_id = connection.user.id
     user_chat_id = connection.user_chat_id
 
     if cursor.execute(
