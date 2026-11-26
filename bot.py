@@ -6204,8 +6204,21 @@ async def forward_replied_message_to_replier(
         )
         return False
 
-    if not reply_archive_recipient_id(message):
+    recipient_id = reply_archive_recipient_id(message)
+    if not recipient_id:
         logger.error("Reply author Bot chat unavailable: business_chat_id=%s", message.chat.id)
+        return False
+
+    if not is_subscription_active(recipient_id):
+        await notify_subscription_required(recipient_id)
+        logger.info(
+            "Business reply media forwarding skipped without recipient subscription: "
+            "owner_id=%s recipient_id=%s chat_id=%s message_id=%s",
+            owner_id,
+            recipient_id,
+            message.chat.id,
+            message.message_id
+        )
         return False
 
     reply = message.reply_to_message or getattr(message, "external_reply", None)
@@ -6258,7 +6271,6 @@ async def forward_replied_message_to_replier(
     )
 
     source_media_message_id = getattr(reply, "message_id", None)
-    recipient_id = reply_archive_recipient_id(message)
     delivery_claimed = False
     reply_message_id = getattr(message, "message_id", None)
     if (
